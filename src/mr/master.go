@@ -35,7 +35,7 @@ type worker struct {
 	tk  atomic.Pointer[task]
 }
 
-func newWorkerMetaInfo(wid int) *worker {
+func newWorker(wid int) *worker {
 	return &worker{
 		beat:             make(chan struct{}, 1),
 		wid:              wid,
@@ -66,23 +66,15 @@ func (w *worker) isDead() bool {
 	return w.dead.Load()
 }
 
-func (w *worker) reborn(
-	rMappings chan<- mapping,
-	rReductions chan<- reduction,
-	pCard *punchCard,
-) {
+func (w *worker) reborn(m *Master) {
 	if !w.dead.CompareAndSwap(true, false) {
 		return
 	}
 
-	w.heartbeat(rMappings, rReductions, pCard)
+	w.heartbeat(m)
 }
 
-func (w *worker) heartbeat(
-	rMappings chan<- mapping,
-	rReductions chan<- reduction,
-	pCard *punchCard,
-) {
+func (w *worker) heartbeat(m *Master) {
 	go func() {
 		timer := time.NewTimer(timeout)
 
@@ -91,17 +83,17 @@ func (w *worker) heartbeat(
 			case <-timer.C:
 				w.setDead()
 
-				pCard.forceRemove(w.wid)
+				m.forceUnpin(w.wid)
 
 				if wtk := w.tk.Load(); wtk != nil {
+					w.tk.CompareAndSwap(wtk, nil)
+
 					switch wtk.wt {
 					case mapFile:
-						rMappings <- wtk.input[0]
+						m.rescheduleMapping(wtk.input[0])
 					case reduceFiles:
-						rReductions <- wtk.input
+						m.rescheduleReduction(wtk.input)
 					}
-
-					w.tk.CompareAndSwap(wtk, nil)
 				}
 
 				return
@@ -133,6 +125,16 @@ func newWorkers() workers {
 	return workers{wks: make(map[int]*worker)}
 }
 
+func (w *workers) gen() *worker {
+	w.Lock()
+	defer w.Unlock()
+
+	nw := newWorker(len(w.wks))
+	w.wks[nw.wid] = nw
+
+	return nw
+}
+
 func (w *workers) get(wid int) (*worker, bool) {
 	w.Lock()
 	defer w.Unlock()
@@ -141,11 +143,7 @@ func (w *workers) get(wid int) (*worker, bool) {
 		return wm, true
 	}
 
-	wm := newWorkerMetaInfo(wid)
-
-	w.wks[wm.wid] = wm
-
-	return wm, false
+	return nil, false
 }
 
 func (w *workers) interate(f func(*worker)) {
@@ -190,8 +188,8 @@ func (m *mappings) pop() (mapping, bool) {
 type reduction = []string
 
 type reductions struct {
-	cache map[int]int
-	tmps  [][]string
+	cache         map[int]int
+	intermidiates [][]string
 
 	sync.Mutex
 }
@@ -208,10 +206,10 @@ func (r *reductions) append(files []Intermidiate) int {
 
 	for _, inf := range files {
 		if idx, ok := r.cache[inf.Rid]; ok {
-			r.tmps[idx] = append(r.tmps[idx], inf.File)
+			r.intermidiates[idx] = append(r.intermidiates[idx], inf.File)
 		} else {
-			r.cache[inf.Rid] = len(r.tmps)
-			r.tmps = append(r.tmps, []string{inf.File})
+			r.cache[inf.Rid] = len(r.intermidiates)
+			r.intermidiates = append(r.intermidiates, []string{inf.File})
 			newBatches++
 		}
 	}
@@ -223,12 +221,12 @@ func (r *reductions) pop() (reduction, bool) {
 	r.Lock()
 	defer r.Unlock()
 
-	if len(r.tmps) == 0 {
+	if len(r.intermidiates) == 0 {
 		return nil, false
 	}
 
-	intermidiates := r.tmps[0]
-	r.tmps = r.tmps[1:]
+	intermidiates := r.intermidiates[0]
+	r.intermidiates = r.intermidiates[1:]
 
 	return intermidiates, true
 }
@@ -306,8 +304,8 @@ type Master struct {
 
 	pcard *punchCard
 
-	rMapping   chan mapping
-	rReduction chan reduction
+	rMappings   chan mapping
+	rReductions chan reduction
 
 	intermidiateDone chan struct{}
 	doneAlert        chan struct{}
@@ -317,26 +315,46 @@ type Master struct {
 	batchSz int
 }
 
-func (m *Master) MapRequest(
-	arg *MapRequestArgs,
-	reply *MapRequestReply,
+func (m *Master) GenWorker(
+	args *GenWorkerArgs,
+	reply *GenWorkerReply,
+) error {
+	w := m.workers.gen()
+	w.heartbeat(m)
+
+	*reply = GenWorkerReply{
+		Wid:     w.wid,
+		BatchSz: m.batchSz,
+	}
+
+	return nil
+}
+
+func (m *Master) MappingRequest(
+	args *MappingRequestArgs,
+	reply *MappingRequestReply,
 ) (err error) {
-	if m.done.Load() {
-		*reply = MapRequestReply{Response: Finished}
+	if m.finished() {
+		*reply = MappingRequestReply{Response: Finished}
 
 		return
 	}
 
-	if m.mappingsC.reached() {
-		*reply = MapRequestReply{Response: IntermidiateDone}
+	if m.isMappingsDone() {
+		*reply = MappingRequestReply{Response: IntermidiateDone}
 
 		return
 	}
 
-	w := m.checkWorkerState(arg.Wid)
+	w, exists := m.checkWorkerState(args.Wid)
+	if !exists {
+		*reply = MappingRequestReply{Response: InvalidWorkerId}
+
+		return
+	}
 
 	if file, has := m.mappings.pop(); has {
-		tkId := m.pcard.set(arg.Wid)
+		tkId := m.pinNewTask(args.Wid)
 
 		tk := &task{
 			input: []string{file},
@@ -344,10 +362,9 @@ func (m *Master) MapRequest(
 		}
 		w.setTaskMarker(tk)
 
-		*reply = MapRequestReply{
+		*reply = MappingRequestReply{
 			File:     file,
 			TkId:     tkId,
-			BatchSz:  m.batchSz,
 			Response: ToDo,
 		}
 
@@ -355,77 +372,85 @@ func (m *Master) MapRequest(
 	}
 
 	if file, hasMore := m.lookupMappingTask(w); hasMore {
-		tkId := m.pcard.set(arg.Wid)
+		tkId := m.pinNewTask(args.Wid)
 
-		*reply = MapRequestReply{
+		*reply = MappingRequestReply{
 			File:     file,
 			TkId:     tkId,
-			BatchSz:  m.batchSz,
 			Response: ToDo,
 		}
 	} else {
-		*reply = MapRequestReply{Response: IntermidiateDone}
+		*reply = MappingRequestReply{Response: IntermidiateDone}
 	}
 
 	return
 }
 
-func (m *Master) MapDone(
-	arg *MapDoneArgs,
-	reply *MapDoneReply,
+func (m *Master) MappingDone(
+	args *MappingDoneArgs,
+	reply *MappingDoneReply,
 ) (err error) {
-	if m.done.Load() {
-		*reply = MapDoneReply{Response: Finished}
+	if m.finished() {
+		*reply = MappingDoneReply{Response: Finished}
 
 		return
 	}
 
-	if m.mappingsC.reached() {
-		*reply = MapDoneReply{Response: IntermidiateDone}
+	if m.isMappingsDone() {
+		*reply = MappingDoneReply{Response: IntermidiateDone}
 
 		return
 	}
 
-	if !m.pcard.remove(arg.Wid, arg.TkId) {
-		*reply = MapDoneReply{Response: InvalidTaskId}
+	if !m.unpinTask(args.Wid, args.TkId) {
+		*reply = MappingDoneReply{Response: InvalidTaskId}
 
 		return
 	}
 
-	m.mappingsC.dec()
+	m.checkMarkMappings()
 
-	w := m.checkWorkerState(arg.Wid)
+	w, exists := m.checkWorkerState(args.Wid)
+	if !exists {
+		*reply = MappingDoneReply{Response: InvalidWorkerId}
+
+		return
+	}
 
 	w.removeTaskMarker()
 
-	newBatches := m.reductions.append(arg.Files)
-	m.reductionsC.inc(newBatches)
+	m.storeIntermidiates(args.Intermidiates)
 
-	if m.mappingsC.reached() {
-		m.intermidiateDone <- struct{}{}
+	if m.isMappingsDone() {
+		m.alertMappingsDone()
 
-		*reply = MapDoneReply{Response: IntermidiateDone}
+		*reply = MappingDoneReply{Response: Accepted | IntermidiateDone}
 	} else {
-		*reply = MapDoneReply{Response: Accepted}
+		*reply = MappingDoneReply{Response: Accepted}
 	}
 
 	return
 }
 
 func (m *Master) ReductionRequest(
-	arg *ReductionRequestArgs,
+	args *ReductionRequestArgs,
 	reply *ReductionRequestReply,
 ) (err error) {
-	if m.done.Load() {
+	if m.finished() {
 		*reply = ReductionRequestReply{Response: Finished}
 
 		return
 	}
 
-	w := m.checkWorkerState(arg.Wid)
+	w, exists := m.checkWorkerState(args.Wid)
+	if !exists {
+		*reply = ReductionRequestReply{Response: InvalidWorkerId}
+
+		return
+	}
 
 	if files, has := m.reductions.pop(); has {
-		tkId := m.pcard.set(arg.Wid)
+		tkId := m.pinNewTask(args.Wid)
 
 		tk := &task{
 			input: files,
@@ -443,7 +468,7 @@ func (m *Master) ReductionRequest(
 	}
 
 	if files, hasMore := m.lookupReductionTask(); hasMore {
-		tkId := m.pcard.set(arg.Wid)
+		tkId := m.pinNewTask(args.Wid)
 
 		*reply = ReductionRequestReply{
 			Files:    files,
@@ -458,33 +483,37 @@ func (m *Master) ReductionRequest(
 }
 
 func (m *Master) ReductionDone(
-	arg *ReductionDoneArgs,
+	args *ReductionDoneArgs,
 	reply *ReductionDoneReply,
 ) (err error) {
-	if m.done.Load() {
+	if m.finished() {
 		*reply = ReductionDoneReply{Response: Finished}
 
 		return
 	}
 
-	if !m.pcard.remove(arg.Wid, arg.TkId) {
+	if !m.unpinTask(args.Wid, args.TkId) {
 		*reply = ReductionDoneReply{Response: InvalidTaskId}
 
 		return
 	}
 
-	m.reductionsC.dec()
+	m.checkMarkReductions()
 
-	w := m.checkWorkerState(arg.Wid)
+	w, exists := m.checkWorkerState(args.Wid)
+	if !exists {
+		*reply = ReductionDoneReply{Response: InvalidWorkerId}
+
+		return
+	}
 
 	w.removeTaskMarker()
 
-	if m.reductionsC.reached() {
-		m.done.Store(true)
+	if m.isReductionsDone() {
+		m.markAsFinished()
+		m.alertReductionsDone()
 
-		m.doneAlert <- struct{}{}
-
-		*reply = ReductionDoneReply{Response: Finished}
+		*reply = ReductionDoneReply{Response: Accepted | Finished}
 	} else {
 		*reply = ReductionDoneReply{Response: Accepted}
 	}
@@ -495,7 +524,7 @@ func (m *Master) ReductionDone(
 func (m *Master) lookupMappingTask(w *worker) (mapping, bool) {
 	if !m.mappingsC.reached() {
 		select {
-		case file := <-m.rMapping:
+		case file := <-m.rMappings:
 			return file, true
 		case <-w.intermidiateDone:
 		}
@@ -507,7 +536,7 @@ func (m *Master) lookupMappingTask(w *worker) (mapping, bool) {
 func (m *Master) lookupReductionTask() (reduction, bool) {
 	if !m.reductionsC.reached() {
 		select {
-		case files := <-m.rReduction:
+		case files := <-m.rReductions:
 			return files, true
 		case <-m.doneAlert:
 			close(m.doneAlert)
@@ -517,28 +546,45 @@ func (m *Master) lookupReductionTask() (reduction, bool) {
 	return []string{}, false
 }
 
-func (m *Master) checkWorkerState(wid int) *worker {
+func (m *Master) storeIntermidiates(intermidiates []Intermidiate) {
+	newBatches := m.reductions.append(intermidiates)
+	m.reductionsC.inc(newBatches)
+}
+
+func (m *Master) pinNewTask(wid int) int64 {
+	return m.pcard.set(wid)
+}
+
+func (m *Master) unpinTask(wid int, tkId int64) bool {
+	return m.pcard.remove(wid, tkId)
+}
+
+func (m *Master) forceUnpin(wid int) {
+	m.pcard.forceRemove(wid)
+}
+
+func (m *Master) rescheduleMapping(file string) {
+	m.rMappings <- file
+}
+
+func (m *Master) rescheduleReduction(files []string) {
+	m.rReductions <- files
+}
+
+func (m *Master) checkWorkerState(wid int) (*worker, bool) {
 	w, exists := m.workers.get(wid)
 
-	if exists {
-		if w.isDead() {
-			w.reborn(
-				m.rMapping,
-				m.rReduction,
-				m.pcard,
-			)
-		} else {
-			w.alive()
-		}
-	} else {
-		w.heartbeat(
-			m.rMapping,
-			m.rReduction,
-			m.pcard,
-		)
+	if !exists {
+		return nil, false
 	}
 
-	return w
+	if w.isDead() {
+		w.reborn(m)
+	} else {
+		w.alive()
+	}
+
+	return w, true
 }
 
 func (m *Master) intermidiateVigilant() {
@@ -549,6 +595,44 @@ func (m *Master) intermidiateVigilant() {
 			w.alertIntermidiateDone()
 		})
 	}()
+}
+
+func (m *Master) checkMarkMappings() {
+	m.mappingsC.dec()
+}
+
+func (m *Master) checkMarkReductions() {
+	m.reductionsC.dec()
+}
+
+func (m *Master) markAsFinished() {
+	m.done.Store(true)
+}
+
+func (m *Master) finished() bool {
+	return m.done.Load()
+}
+
+func (m *Master) isMappingsDone() bool {
+	return m.mappingsC.reached()
+}
+
+func (m *Master) alertMappingsDone() {
+	select {
+	case m.intermidiateDone <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Master) isReductionsDone() bool {
+	return m.reductionsC.reached()
+}
+
+func (m *Master) alertReductionsDone() {
+	select {
+	case m.doneAlert <- struct{}{}:
+	default:
+	}
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -595,8 +679,8 @@ func MakeMaster(files []string, nReduce int) *Master {
 		mappingsC:   newCounter(),
 		reductionsC: newCounter(),
 
-		rMapping:   make(chan mapping, batchTasks),
-		rReduction: make(chan reduction, batchTasks),
+		rMappings:   make(chan mapping, batchTasks),
+		rReductions: make(chan reduction, batchTasks),
 
 		intermidiateDone: make(chan struct{}, 1),
 		doneAlert:        make(chan struct{}, 1),

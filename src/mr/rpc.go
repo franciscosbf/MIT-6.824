@@ -12,11 +12,12 @@ import (
 type DeliveryResponse int
 
 const (
-	ToDo DeliveryResponse = iota
-	Accepted
-	InvalidTaskId
-	IntermidiateDone
-	Finished
+	ToDo             DeliveryResponse = 1 << 0
+	Accepted                          = 1 << 1
+	InvalidTaskId                     = 1 << 2
+	InvalidWorkerId                   = 1 << 3
+	IntermidiateDone                  = 1 << 4
+	Finished                          = 1 << 5
 )
 
 type Intermidiate struct {
@@ -24,24 +25,31 @@ type Intermidiate struct {
 	Rid  int
 }
 
-type MapRequestArgs struct {
-	Wid int
+type GenWorkerArgs struct{}
+
+type GenWorkerReply struct {
+	Wid     int
+	BatchSz int
 }
 
-type MapRequestReply struct {
+type MappingRequestArgs struct {
+	Wid        int
+	Registered bool
+}
+
+type MappingRequestReply struct {
 	File     string
 	TkId     int64
-	BatchSz  int
 	Response DeliveryResponse
 }
 
-type MapDoneArgs struct {
-	Files []Intermidiate
-	Wid   int
-	TkId  int64
+type MappingDoneArgs struct {
+	Intermidiates []Intermidiate
+	Wid           int
+	TkId          int64
 }
 
-type MapDoneReply struct {
+type MappingDoneReply struct {
 	Response DeliveryResponse
 }
 
