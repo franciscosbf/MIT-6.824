@@ -3,14 +3,21 @@ package mr
 import (
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"net/rpc"
+	"os"
 )
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
 	Key   string
 	Value string
+}
+
+type bucket struct {
+	filename string
+	f        *os.File
 }
 
 // use ihash(key) % NReduce to choose the reduce
@@ -30,6 +37,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	var (
 		wid            int
 		tkId           int64
+		failed         bool
 		batchSz        int
 		file           string
 		files          []string
@@ -69,7 +77,63 @@ mapping:
 		case ToDo:
 			file = reply.File
 			tkId = reply.TkId
-			// TODO: do map stuff
+
+			f, err := os.Open(file)
+			if failed = err != nil; failed {
+				log.Fatalf("cannot open %v", file)
+				goto abort_mapping
+			}
+			content, err := ioutil.ReadAll(f)
+			if failed = err != nil; failed {
+				log.Fatalf("cannot read %v", file)
+				goto abort_mapping
+			}
+			f.Close()
+
+			kv := mapf(file, string(content))
+
+			buckets := make([]*bucket, batchSz)
+			closeBuckets := func() {
+				for _, b := range buckets {
+					if b.f != nil {
+						b.f.Close()
+					}
+				}
+			}
+			for _, p := range kv {
+				bktid := ihash(p.Key) % batchSz
+				b := buckets[bktid]
+				if b == nil {
+					filename := fmt.Sprintf("mr-%d-%d-%d-*", wid, bktid, tkId)
+					tmpFilename := fmt.Sprintf("%v-*", filename)
+					f, err = ioutil.TempFile("", tmpFilename)
+					if failed = err != nil; failed {
+						closeBuckets()
+						goto abort_mapping
+					}
+					b = &bucket{
+						filename: filename,
+						f:        f,
+					}
+					buckets[bktid] = b
+				}
+				pair := fmt.Sprintf("%s %s\n", p.Key, p.Value)
+				_, err = f.Write([]byte(pair))
+				if failed = err != nil; failed {
+					closeBuckets()
+					goto abort_mapping
+				}
+			}
+			for _, b := range buckets {
+				if b.f != nil {
+					err := os.Rename(b.f.Name(), b.filename)
+					if failed = err != nil; failed {
+						closeBuckets()
+						goto abort_mapping
+					}
+					b.f.Close()
+				}
+			}
 		case IntermidiateDone:
 			goto reduction
 		case InvalidWorkerId:
@@ -80,17 +144,21 @@ mapping:
 			return
 		}
 	}
+abort_mapping:
 	{
-		args := MappingDoneArgs{Wid: wid, Intermidiates: intermidiates, TkId: tkId}
+		args := MappingDoneArgs{
+			Wid:           wid,
+			Intermidiates: intermidiates,
+			TkId:          tkId,
+			Failed:        failed,
+		}
 		reply := MappingDoneReply{}
 		if !call("Master.MappingDone", &args, &reply) {
 			return
 		}
 		switch reply.Response {
 		case Accepted | IntermidiateDone:
-			// TODO: write to disk
 		case Accepted:
-			// TODO: write to disk
 			goto mapping
 		case InvalidTaskId:
 			goto mapping
@@ -115,6 +183,7 @@ reduction:
 			files = reply.Files
 			tkId = reply.TkId
 			// TODO: do reduction stuff
+			// TODO: write to disk
 		case InvalidWorkerId:
 			if !genWorker() {
 				return
@@ -123,17 +192,20 @@ reduction:
 			return
 		}
 	}
+abort_reduction:
 	{
-		args := ReductionDoneArgs{Wid: wid, TkId: tkId}
+		args := ReductionDoneArgs{
+			Wid:    wid,
+			TkId:   tkId,
+			Failed: failed,
+		}
 		reply := ReductionDoneReply{}
 		if !call("Master.ReductionDone", &args, &reply) {
 			return
 		}
 		switch reply.Response {
 		case Accepted | Finished:
-			// TODO: write to disk
 		case Accepted:
-			// TODO: write to disk
 			goto reduction
 		case InvalidTaskId:
 			goto reduction
@@ -146,34 +218,14 @@ reduction:
 	}
 }
 
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-// func CallExample() {
-// 	// declare an argument structure.
-// 	args := ExampleArgs{}
-//
-// 	// fill in the argument(s).
-// 	args.X = 99
-//
-// 	// declare a reply structure.
-// 	reply := ExampleReply{}
-//
-// 	// send the RPC request, wait for the reply.
-// 	call("Master.Example", &args, &reply)
-//
-// 	// reply.Y should be 100.
-// 	fmt.Printf("reply.Y %v\n", reply.Y)
-// }
-
 // send an RPC request to the master, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-func call(rpcname string, args interface{}, reply interface{}) bool {
+func call(rpcname string, args any, reply any) bool {
 	sockname := masterSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		log.Fatal("dialing: ", err)
 	}
 	defer c.Close()
 
@@ -182,6 +234,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	fmt.Println(err)
+	log.Fatal("calling: ", err)
+
 	return false
 }

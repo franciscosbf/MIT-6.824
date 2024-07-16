@@ -82,8 +82,13 @@ func (w *worker) heartbeat(m *Master) {
 			select {
 			case <-timer.C:
 				w.setDead()
+				m.increaseDeadWorkers()
 
 				m.forceUnpin(w.wid)
+
+				if m.allDead() {
+					m.finalize()
+				}
 
 				if wtk := w.tk.Load(); wtk != nil {
 					w.tk.CompareAndSwap(wtk, nil)
@@ -116,13 +121,14 @@ func (w *worker) alertIntermidiateDone() {
 }
 
 type workers struct {
-	wks map[int]*worker
+	wks        map[int]*worker
+	registered atomic.Int64
 
 	sync.RWMutex
 }
 
-func newWorkers() workers {
-	return workers{wks: make(map[int]*worker)}
+func newWorkers() *workers {
+	return &workers{wks: make(map[int]*worker)}
 }
 
 func (w *workers) gen() *worker {
@@ -132,12 +138,14 @@ func (w *workers) gen() *worker {
 	nw := newWorker(len(w.wks))
 	w.wks[nw.wid] = nw
 
+	w.registered.Add(1)
+
 	return nw
 }
 
 func (w *workers) get(wid int) (*worker, bool) {
-	w.Lock()
-	defer w.Unlock()
+	w.RLock()
+	defer w.RUnlock()
 
 	if wm, exists := w.wks[wid]; exists {
 		return wm, true
@@ -147,12 +155,16 @@ func (w *workers) get(wid int) (*worker, bool) {
 }
 
 func (w *workers) interate(f func(*worker)) {
-	w.Lock()
-	defer w.Unlock()
+	w.RLock()
+	defer w.RUnlock()
 
 	for _, wm := range w.wks {
 		f(wm)
 	}
+}
+
+func (w *workers) registeredWorkers() int64 {
+	return w.registered.Load()
 }
 
 type mapping = string
@@ -243,16 +255,24 @@ func (bc *counter) set(v int) {
 	bc.c.Store(int64(v))
 }
 
-func (bc *counter) inc(v int) {
+func (bc *counter) add(v int) {
 	bc.c.Add(int64(v))
+}
+
+func (bc *counter) inc() {
+	bc.c.Add(1)
 }
 
 func (bc *counter) dec() {
 	bc.c.Add(-1)
 }
 
-func (bc *counter) reached() bool {
+func (bc *counter) zeroed() bool {
 	return bc.c.Load() <= 0
+}
+
+func (bc *counter) get() int64 {
+	return bc.c.Load()
 }
 
 type punchCard struct {
@@ -299,8 +319,9 @@ type Master struct {
 	mappings   *mappings
 	reductions *reductions
 
-	mappingsC   *counter
-	reductionsC *counter
+	mappingsC    *counter
+	reductionsC  *counter
+	deadWorkersC *counter
 
 	pcard *punchCard
 
@@ -311,7 +332,7 @@ type Master struct {
 	doneAlert        chan struct{}
 	done             atomic.Bool
 
-	workers workers
+	workers *workers
 	batchSz int
 }
 
@@ -340,7 +361,7 @@ func (m *Master) MappingRequest(
 		return
 	}
 
-	if m.isMappingsDone() {
+	if m.areMappingsDone() {
 		*reply = MappingRequestReply{Response: IntermidiateDone}
 
 		return
@@ -396,8 +417,16 @@ func (m *Master) MappingDone(
 		return
 	}
 
-	if m.isMappingsDone() {
+	if m.areMappingsDone() {
 		*reply = MappingDoneReply{Response: IntermidiateDone}
+
+		return
+	}
+
+	if args.Failed {
+		m.finalize()
+
+		*reply = MappingDoneReply{Response: Finished}
 
 		return
 	}
@@ -421,7 +450,7 @@ func (m *Master) MappingDone(
 
 	m.storeIntermidiates(args.Intermidiates)
 
-	if m.isMappingsDone() {
+	if m.areMappingsDone() {
 		m.alertMappingsDone()
 
 		*reply = MappingDoneReply{Response: Accepted | IntermidiateDone}
@@ -492,6 +521,14 @@ func (m *Master) ReductionDone(
 		return
 	}
 
+	if args.Failed {
+		m.finalize()
+
+		*reply = ReductionDoneReply{Response: Finished}
+
+		return
+	}
+
 	if !m.unpinTask(args.Wid, args.TkId) {
 		*reply = ReductionDoneReply{Response: InvalidTaskId}
 
@@ -509,9 +546,8 @@ func (m *Master) ReductionDone(
 
 	w.removeTaskMarker()
 
-	if m.isReductionsDone() {
-		m.markAsFinished()
-		m.alertReductionsDone()
+	if m.areReductionsDone() {
+		m.finalize()
 
 		*reply = ReductionDoneReply{Response: Accepted | Finished}
 	} else {
@@ -522,7 +558,7 @@ func (m *Master) ReductionDone(
 }
 
 func (m *Master) lookupMappingTask(w *worker) (mapping, bool) {
-	if !m.mappingsC.reached() {
+	if !m.mappingsC.zeroed() {
 		select {
 		case file := <-m.rMappings:
 			return file, true
@@ -534,7 +570,7 @@ func (m *Master) lookupMappingTask(w *worker) (mapping, bool) {
 }
 
 func (m *Master) lookupReductionTask() (reduction, bool) {
-	if !m.reductionsC.reached() {
+	if !m.reductionsC.zeroed() {
 		select {
 		case files := <-m.rReductions:
 			return files, true
@@ -548,7 +584,7 @@ func (m *Master) lookupReductionTask() (reduction, bool) {
 
 func (m *Master) storeIntermidiates(intermidiates []Intermidiate) {
 	newBatches := m.reductions.append(intermidiates)
-	m.reductionsC.inc(newBatches)
+	m.reductionsC.add(newBatches)
 }
 
 func (m *Master) pinNewTask(wid int) int64 {
@@ -580,6 +616,7 @@ func (m *Master) checkWorkerState(wid int) (*worker, bool) {
 
 	if w.isDead() {
 		w.reborn(m)
+		m.decreaseDeadWorkers()
 	} else {
 		w.alive()
 	}
@@ -605,16 +642,12 @@ func (m *Master) checkMarkReductions() {
 	m.reductionsC.dec()
 }
 
-func (m *Master) markAsFinished() {
-	m.done.Store(true)
-}
-
 func (m *Master) finished() bool {
 	return m.done.Load()
 }
 
-func (m *Master) isMappingsDone() bool {
-	return m.mappingsC.reached()
+func (m *Master) areMappingsDone() bool {
+	return m.mappingsC.zeroed()
 }
 
 func (m *Master) alertMappingsDone() {
@@ -624,15 +657,31 @@ func (m *Master) alertMappingsDone() {
 	}
 }
 
-func (m *Master) isReductionsDone() bool {
-	return m.reductionsC.reached()
-}
+func (m *Master) finalize() {
+	if !m.done.CompareAndSwap(false, true) {
+		return
+	}
 
-func (m *Master) alertReductionsDone() {
 	select {
 	case m.doneAlert <- struct{}{}:
 	default:
 	}
+}
+
+func (m *Master) areReductionsDone() bool {
+	return m.reductionsC.zeroed()
+}
+
+func (m *Master) increaseDeadWorkers() {
+	m.deadWorkersC.inc()
+}
+
+func (m *Master) decreaseDeadWorkers() {
+	m.deadWorkersC.inc()
+}
+
+func (m *Master) allDead() bool {
+	return m.deadWorkersC.get() == m.workers.registeredWorkers()
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -689,7 +738,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 		batchSz: nReduce,
 	}
 
-	m.mappingsC.inc(batchTasks)
+	m.mappingsC.add(batchTasks)
 	m.intermidiateVigilant()
 
 	m.server()
