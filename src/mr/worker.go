@@ -294,7 +294,7 @@ reduction:
 				}
 				output := reducef(kvs[i].Key, values)
 
-				_, err := fmt.Fprintf(f, "%s %s\n", kvs[i].Key, output)
+				_, err := fmt.Fprintf(f, "%v %v\n", kvs[i].Key, output)
 				if err != nil {
 					log.Fatalf("cannot write to %v\n", f.Name())
 				}
