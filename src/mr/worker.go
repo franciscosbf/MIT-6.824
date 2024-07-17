@@ -101,7 +101,7 @@ mapping:
 				bktid := ihash(p.Key) % batchSz
 				b := buckets[bktid]
 				if b == nil {
-					filename := fmt.Sprintf("mr-%v-%v-%v", wid, bktid, tkId)
+					filename := fmt.Sprintf("mr-%v-%v", wid, bktid)
 					tmpFilename := fmt.Sprintf("%v-*", filename)
 					f, err = ioutil.TempFile("", tmpFilename)
 					if err != nil {
