@@ -37,26 +37,20 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-const maxGenTries = 3
-
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string,
 ) {
 	var (
-		remainingGenTries = maxGenTries
-		wid               int
-		tkId              int64
-		batchSz           int
-		file              string
-		intermidiates     []Intermidiate
-		files             []string
+		wid           int
+		tkId          int64
+		batchSz       int
+		file          string
+		intermidiates []Intermidiate
+		files         []string
 	)
 
-	genWorker := func() bool {
-		if remainingGenTries--; remainingGenTries == 0 {
-			return false
-		}
+	{
 
 		args := GenWorkerArgs{}
 		reply := GenWorkerReply{}
@@ -64,12 +58,6 @@ func Worker(mapf func(string, string) []KeyValue,
 
 		wid = reply.Wid
 		batchSz = reply.BatchSz
-
-		return true
-	}
-
-	if !genWorker() {
-		return
 	}
 
 mapping:
@@ -133,11 +121,7 @@ mapping:
 			}
 		case IntermidiateDone:
 			goto reduction
-		case InvalidWorkerId:
-			if !genWorker() {
-				return
-			}
-		case Finished:
+		case InvalidWorkerId, Finished:
 			return
 		}
 	}
@@ -155,11 +139,7 @@ mapping:
 			goto mapping
 		case InvalidTaskId:
 			goto mapping
-		case InvalidWorkerId:
-			if !genWorker() {
-				return
-			}
-		case Finished:
+		case InvalidWorkerId, Finished:
 			return
 		}
 	}
@@ -222,8 +202,9 @@ reduction:
 						f.Close()
 
 						lines := strings.Split(string(content), "\n")
-						kvs := make([]KeyValue, len(lines))
-						for i, line := range lines {
+						nLines := len(lines) - 1
+						kvs := make([]KeyValue, nLines)
+						for i, line := range lines[:nLines] {
 							ls := strings.Split(line, " ")
 							kvs[i] = KeyValue{Key: ls[0], Value: ls[1]}
 						}
@@ -281,8 +262,7 @@ reduction:
 				}
 				output := reducef(kvs[i].Key, values)
 
-				_, err := fmt.Fprintf(f, "%v %v\n", kvs[i].Key, output)
-				if err != nil {
+				if _, err := fmt.Fprintf(f, "%v %v\n", kvs[i].Key, output); err != nil {
 					log.Fatalf("cannot write to %v\n", f.Name())
 				}
 
@@ -293,11 +273,7 @@ reduction:
 				log.Fatalf("cannot rename %v to %v\n", f.Name(), filename)
 			}
 			f.Close()
-		case InvalidWorkerId:
-			if !genWorker() {
-				return
-			}
-		case Finished:
+		case InvalidWorkerId, Finished:
 			return
 		}
 	}
@@ -314,11 +290,7 @@ reduction:
 			goto reduction
 		case InvalidTaskId:
 			goto reduction
-		case InvalidWorkerId:
-			if genWorker() {
-				goto reduction
-			}
-		case Finished:
+		case InvalidWorkerId, Finished:
 		}
 	}
 }
