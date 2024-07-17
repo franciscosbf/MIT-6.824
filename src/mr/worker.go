@@ -218,13 +218,13 @@ reduction:
 
 						f, err := os.Open(file)
 						if err != nil {
-							log.Printf("cannot open %v\n", file)
+							log.Fatalf("cannot open %v\n", file)
 							prereduction <- nil
 							return
 						}
 						content, err := ioutil.ReadAll(f)
 						if err != nil {
-							log.Printf("cannot read %v\n", file)
+							log.Fatalf("cannot read %v\n", file)
 							prereduction <- nil
 							return
 						}
@@ -264,11 +264,7 @@ reduction:
 			}
 
 			for range nFiles {
-				pr := <-prereduction
-				if pr == nil {
-					return
-				}
-				kvs = append(kvs, pr...)
+				kvs = append(kvs, <-prereduction...)
 			}
 			close(finish)
 
