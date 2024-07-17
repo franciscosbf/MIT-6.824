@@ -178,7 +178,6 @@ reduction:
 
 			nFiles := len(files)
 			nCpus := runtime.NumCPU()
-			finish := make(chan struct{})
 			jobs := make(chan string, nFiles)
 			prereduction := make(chan []KeyValue, nFiles)
 			kvs := []KeyValue{}
@@ -196,16 +195,16 @@ reduction:
 			for range nWorkers {
 				go func(
 					jobs <-chan string,
-					finish <-chan struct{},
 					prereduction chan<- []KeyValue,
 				) {
-					var file string
+					var (
+						file string
+						ok   bool
+					)
 
 					for {
-						select {
-						case <-finish:
+						if file, ok = <-jobs; !ok {
 							return
-						case file = <-jobs:
 						}
 
 						f, err := os.Open(file)
@@ -252,13 +251,13 @@ reduction:
 						}
 						prereduction <- prevKvs
 					}
-				}(jobs, finish, prereduction)
+				}(jobs, prereduction)
 			}
 
 			for range nFiles {
 				kvs = append(kvs, <-prereduction...)
 			}
-			close(finish)
+			close(jobs)
 
 			filename := fmt.Sprintf("mr-out-%d", wid)
 			tmpFilename := fmt.Sprintf("%v-*", filename)
