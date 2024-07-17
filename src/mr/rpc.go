@@ -47,7 +47,6 @@ type MappingDoneArgs struct {
 	Intermidiates []Intermidiate
 	Wid           int
 	TkId          int64
-	Failed        bool
 }
 
 type MappingDoneReply struct {
@@ -65,9 +64,8 @@ type ReductionRequestReply struct {
 }
 
 type ReductionDoneArgs struct {
-	Wid    int
-	TkId   int64
-	Failed bool
+	Wid  int
+	TkId int64
 }
 
 type ReductionDoneReply struct {

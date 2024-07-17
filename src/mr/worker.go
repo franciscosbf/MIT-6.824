@@ -7,6 +7,9 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"runtime"
+	"sort"
+	"strings"
 )
 
 // Map functions return a slice of KeyValue.
@@ -15,9 +18,15 @@ type KeyValue struct {
 	Value string
 }
 
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 type bucket struct {
-	filename string
 	f        *os.File
+	filename string
 }
 
 // use ihash(key) % NReduce to choose the reduce
@@ -28,33 +37,30 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-const initalizationTries = 3
+const maxGenTries = 3
 
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string,
 ) {
 	var (
-		wid            int
-		tkId           int64
-		failed         bool
-		batchSz        int
-		file           string
-		files          []string
-		intermidiates  []Intermidiate
-		remainingTries = initalizationTries
+		remainingGenTries = maxGenTries
+		wid               int
+		tkId              int64
+		batchSz           int
+		file              string
+		intermidiates     []Intermidiate
+		files             []string
 	)
 
 	genWorker := func() bool {
-		if remainingTries--; remainingTries == 0 {
+		if remainingGenTries--; remainingGenTries == 0 {
 			return false
 		}
 
 		args := GenWorkerArgs{}
 		reply := GenWorkerReply{}
-		if !call("Master.GenWorker", &args, &reply) {
-			return true
-		}
+		call("Master.GenWorker", &args, &reply)
 
 		wid = reply.Wid
 		batchSz = reply.BatchSz
@@ -70,46 +76,36 @@ mapping:
 	{
 		args := MappingRequestArgs{Wid: wid}
 		reply := MappingRequestReply{}
-		if !call("Master.MappingRequest", &args, &reply) {
-			return
-		}
+		call("Master.MappingRequest", &args, &reply)
 		switch reply.Response {
 		case ToDo:
+			intermidiates = nil
 			file = reply.File
 			tkId = reply.TkId
 
 			f, err := os.Open(file)
-			if failed = err != nil; failed {
-				log.Fatalf("cannot open %v", file)
-				goto abort_mapping
+			if err != nil {
+				log.Fatalf("cannot open %v\n", file)
 			}
 			content, err := ioutil.ReadAll(f)
-			if failed = err != nil; failed {
-				log.Fatalf("cannot read %v", file)
-				goto abort_mapping
+			if err != nil {
+				log.Fatalf("cannot read %v\n", file)
 			}
 			f.Close()
 
-			kv := mapf(file, string(content))
+			kvs := mapf(file, string(content))
 
 			buckets := make([]*bucket, batchSz)
-			closeBuckets := func() {
-				for _, b := range buckets {
-					if b.f != nil {
-						b.f.Close()
-					}
-				}
-			}
-			for _, p := range kv {
+
+			for _, p := range kvs {
 				bktid := ihash(p.Key) % batchSz
 				b := buckets[bktid]
 				if b == nil {
-					filename := fmt.Sprintf("mr-%d-%d-%d-*", wid, bktid, tkId)
+					filename := fmt.Sprintf("mr-%v-%v-%v", wid, bktid, tkId)
 					tmpFilename := fmt.Sprintf("%v-*", filename)
 					f, err = ioutil.TempFile("", tmpFilename)
-					if failed = err != nil; failed {
-						closeBuckets()
-						goto abort_mapping
+					if err != nil {
+						log.Fatalf("cannot open tmp file %v\n", tmpFilename)
 					}
 					b = &bucket{
 						filename: filename,
@@ -117,20 +113,29 @@ mapping:
 					}
 					buckets[bktid] = b
 				}
-				pair := fmt.Sprintf("%s %s\n", p.Key, p.Value)
-				_, err = f.Write([]byte(pair))
-				if failed = err != nil; failed {
-					closeBuckets()
-					goto abort_mapping
+				_, err = fmt.Fprintf(f, "%v %v\n", p.Key, p.Value)
+				if err != nil {
+					log.Fatalf("cannot write to %v\n", f.Name())
 				}
 			}
+
+			for btkid, b := range buckets {
+				if b != nil {
+					err := os.Rename(b.f.Name(), b.filename)
+					if err != nil {
+						log.Fatalf("cannot rename %v to %v\n", b.f.Name(), b.filename)
+					}
+					b.f.Close()
+				}
+				it := Intermidiate{
+					File: b.filename,
+					Rid:  btkid,
+				}
+				intermidiates = append(intermidiates, it)
+			}
+
 			for _, b := range buckets {
 				if b.f != nil {
-					err := os.Rename(b.f.Name(), b.filename)
-					if failed = err != nil; failed {
-						closeBuckets()
-						goto abort_mapping
-					}
 					b.f.Close()
 				}
 			}
@@ -144,18 +149,14 @@ mapping:
 			return
 		}
 	}
-abort_mapping:
 	{
 		args := MappingDoneArgs{
 			Wid:           wid,
 			Intermidiates: intermidiates,
 			TkId:          tkId,
-			Failed:        failed,
 		}
 		reply := MappingDoneReply{}
-		if !call("Master.MappingDone", &args, &reply) {
-			return
-		}
+		call("Master.MappingDone", &args, &reply)
 		switch reply.Response {
 		case Accepted | IntermidiateDone:
 		case Accepted:
@@ -175,15 +176,137 @@ reduction:
 	{
 		args := ReductionRequestArgs{Wid: wid}
 		reply := ReductionRequestReply{}
-		if !call("Master.ReductionRequest", &args, &reply) {
-			return
-		}
+		call("Master.ReductionRequest", &args, &reply)
 		switch reply.Response {
 		case ToDo:
 			files = reply.Files
 			tkId = reply.TkId
-			// TODO: do reduction stuff
-			// TODO: write to disk
+
+			var nWorkers int
+
+			nFiles := len(files)
+			nCpus := runtime.NumCPU()
+			finish := make(chan struct{})
+			jobs := make(chan string, nFiles)
+			prereduction := make(chan []KeyValue, nFiles)
+			kvs := []KeyValue{}
+
+			for _, file := range files {
+				jobs <- file
+			}
+
+			if nFiles < nCpus {
+				nWorkers = nFiles
+			} else {
+				nWorkers = nCpus
+			}
+
+			for range nWorkers {
+				go func(
+					jobs <-chan string,
+					finish <-chan struct{},
+					prereduction chan<- []KeyValue,
+				) {
+					var file string
+
+					for {
+						select {
+						case <-finish:
+							return
+						case file = <-jobs:
+						}
+
+						f, err := os.Open(file)
+						if err != nil {
+							log.Printf("cannot open %v\n", file)
+							prereduction <- nil
+							return
+						}
+						content, err := ioutil.ReadAll(f)
+						if err != nil {
+							log.Printf("cannot read %v\n", file)
+							prereduction <- nil
+							return
+						}
+						f.Close()
+
+						lines := strings.Split(string(content), "\n")
+						kvs := make([]KeyValue, len(lines))
+						for i, line := range lines {
+							ls := strings.Split(line, " ")
+							kvs[i] = KeyValue{Key: ls[0], Value: ls[1]}
+						}
+						sort.Sort(ByKey(kvs))
+
+						prevKvs := []KeyValue{}
+						nKvs := len(kvs)
+						i := 0
+						for i < nKvs {
+							j := i + 1
+							for j < nKvs && kvs[j].Key == kvs[i].Key {
+								j++
+							}
+
+							values := []string{}
+							for k := i; k < j; k++ {
+								values = append(values, kvs[k].Value)
+							}
+							output := reducef(kvs[i].Key, values)
+
+							kv := KeyValue{Key: kvs[i].Key, Value: output}
+							prevKvs = append(prevKvs, kv)
+
+							i = j
+						}
+						prereduction <- prevKvs
+					}
+				}(jobs, finish, prereduction)
+			}
+
+			for range nFiles {
+				pr := <-prereduction
+				if pr == nil {
+					return
+				}
+				kvs = append(kvs, pr...)
+			}
+			close(finish)
+
+			filename := fmt.Sprintf("mr-out-%d", wid)
+			tmpFilename := fmt.Sprintf("%v-*", filename)
+			f, err := ioutil.TempFile("", tmpFilename)
+			if err != nil {
+				log.Fatalf("cannot open tmp file %v\n", tmpFilename)
+			}
+
+			sort.Sort(ByKey(kvs))
+			nKvs := len(kvs)
+			i := 0
+			for i < nKvs {
+				j := i + 1
+				for j < nKvs && kvs[j].Key == kvs[i].Key {
+					j++
+				}
+
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, kvs[k].Value)
+				}
+				output := reducef(kvs[i].Key, values)
+
+				_, err := fmt.Fprintf(f, "%s %s\n", kvs[i].Key, output)
+				if err != nil {
+					log.Fatalf("cannot write to %v\n", f.Name())
+				}
+
+				i = j
+			}
+
+			err = os.Rename(f.Name(), filename)
+			if err != nil {
+				log.Fatalf("cannot rename %v to %v\n", f.Name(), filename)
+			}
+			f.Close()
 		case InvalidWorkerId:
 			if !genWorker() {
 				return
@@ -192,17 +315,13 @@ reduction:
 			return
 		}
 	}
-abort_reduction:
 	{
 		args := ReductionDoneArgs{
-			Wid:    wid,
-			TkId:   tkId,
-			Failed: failed,
+			Wid:  wid,
+			TkId: tkId,
 		}
 		reply := ReductionDoneReply{}
-		if !call("Master.ReductionDone", &args, &reply) {
-			return
-		}
+		call("Master.ReductionDone", &args, &reply)
 		switch reply.Response {
 		case Accepted | Finished:
 		case Accepted:
@@ -221,20 +340,15 @@ abort_reduction:
 // send an RPC request to the master, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-func call(rpcname string, args any, reply any) bool {
+func call(rpcname string, args any, reply any) {
 	sockname := masterSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing: ", err)
+		log.Fatalf("dialing: ", err)
 	}
 	defer c.Close()
 
-	err = c.Call(rpcname, args, reply)
-	if err == nil {
-		return true
+	if err := c.Call(rpcname, args, reply); err != nil {
+		log.Fatalf("calling: ", err)
 	}
-
-	log.Fatal("calling: ", err)
-
-	return false
 }

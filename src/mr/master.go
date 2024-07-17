@@ -423,14 +423,6 @@ func (m *Master) MappingDone(
 		return
 	}
 
-	if args.Failed {
-		m.finalize()
-
-		*reply = MappingDoneReply{Response: Finished}
-
-		return
-	}
-
 	if !m.unpinTask(args.Wid, args.TkId) {
 		*reply = MappingDoneReply{Response: InvalidTaskId}
 
@@ -516,14 +508,6 @@ func (m *Master) ReductionDone(
 	reply *ReductionDoneReply,
 ) (err error) {
 	if m.finished() {
-		*reply = ReductionDoneReply{Response: Finished}
-
-		return
-	}
-
-	if args.Failed {
-		m.finalize()
-
 		*reply = ReductionDoneReply{Response: Finished}
 
 		return
