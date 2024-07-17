@@ -1,5 +1,7 @@
 #!/bin/sh
 
+alias go=go1.13
+
 #
 # basic map-reduce test
 #
@@ -32,7 +34,7 @@ failed_any=0
 
 # generate the correct output
 ../mrsequential ../../mrapps/wc.so ../pg*txt || exit 1
-sort mr-out-0 > mr-correct-wc.txt
+sort mr-out-0 >mr-correct-wc.txt
 rm -f mr-out*
 
 echo '***' Starting wc test.
@@ -56,25 +58,26 @@ wait
 # to exit when a job is completely finished, and not before,
 # that means the job has finished.
 
-sort mr-out* | grep . > mr-wc-all
-if cmp mr-wc-all mr-correct-wc.txt
-then
-  echo '---' wc test: PASS
+sort mr-out* | grep . >mr-wc-all
+if cmp mr-wc-all mr-correct-wc.txt; then
+	echo '---' wc test: PASS
 else
-  echo '---' wc output is not the same as mr-correct-wc.txt
-  echo '---' wc test: FAIL
-  failed_any=1
+	echo '---' wc output is not the same as mr-correct-wc.txt
+	echo '---' wc test: FAIL
+	failed_any=1
 fi
 
 # wait for remaining workers and master to exit.
-wait ; wait ; wait
+wait
+wait
+wait
 
 # now indexer
 rm -f mr-*
 
 # generate the correct output
 ../mrsequential ../../mrapps/indexer.so ../pg*txt || exit 1
-sort mr-out-0 > mr-correct-indexer.txt
+sort mr-out-0 >mr-correct-indexer.txt
 rm -f mr-out*
 
 echo '***' Starting indexer test.
@@ -86,18 +89,17 @@ sleep 1
 timeout -k 2s 180s ../mrworker ../../mrapps/indexer.so &
 timeout -k 2s 180s ../mrworker ../../mrapps/indexer.so
 
-sort mr-out* | grep . > mr-indexer-all
-if cmp mr-indexer-all mr-correct-indexer.txt
-then
-  echo '---' indexer test: PASS
+sort mr-out* | grep . >mr-indexer-all
+if cmp mr-indexer-all mr-correct-indexer.txt; then
+	echo '---' indexer test: PASS
 else
-  echo '---' indexer output is not the same as mr-correct-indexer.txt
-  echo '---' indexer test: FAIL
-  failed_any=1
+	echo '---' indexer output is not the same as mr-correct-indexer.txt
+	echo '---' indexer test: FAIL
+	failed_any=1
 fi
 
-wait ; wait
-
+wait
+wait
 
 echo '***' Starting map parallelism test.
 
@@ -109,25 +111,23 @@ sleep 1
 timeout -k 2s 180s ../mrworker ../../mrapps/mtiming.so &
 timeout -k 2s 180s ../mrworker ../../mrapps/mtiming.so
 
-NT=`cat mr-out* | grep '^times-' | wc -l | sed 's/ //g'`
-if [ "$NT" != "2" ]
-then
-  echo '---' saw "$NT" workers rather than 2
-  echo '---' map parallelism test: FAIL
-  failed_any=1
+NT=$(cat mr-out* | grep '^times-' | wc -l | sed 's/ //g')
+if [ "$NT" != "2" ]; then
+	echo '---' saw "$NT" workers rather than 2
+	echo '---' map parallelism test: FAIL
+	failed_any=1
 fi
 
-if cat mr-out* | grep '^parallel.* 2' > /dev/null
-then
-  echo '---' map parallelism test: PASS
+if cat mr-out* | grep '^parallel.* 2' >/dev/null; then
+	echo '---' map parallelism test: PASS
 else
-  echo '---' map workers did not run in parallel
-  echo '---' map parallelism test: FAIL
-  failed_any=1
+	echo '---' map workers did not run in parallel
+	echo '---' map parallelism test: FAIL
+	failed_any=1
 fi
 
-wait ; wait
-
+wait
+wait
 
 echo '***' Starting reduce parallelism test.
 
@@ -139,52 +139,51 @@ sleep 1
 timeout -k 2s 180s ../mrworker ../../mrapps/rtiming.so &
 timeout -k 2s 180s ../mrworker ../../mrapps/rtiming.so
 
-NT=`cat mr-out* | grep '^[a-z] 2' | wc -l | sed 's/ //g'`
-if [ "$NT" -lt "2" ]
-then
-  echo '---' too few parallel reduces.
-  echo '---' reduce parallelism test: FAIL
-  failed_any=1
+NT=$(cat mr-out* | grep '^[a-z] 2' | wc -l | sed 's/ //g')
+if [ "$NT" -lt "2" ]; then
+	echo '---' too few parallel reduces.
+	echo '---' reduce parallelism test: FAIL
+	failed_any=1
 else
-  echo '---' reduce parallelism test: PASS
+	echo '---' reduce parallelism test: PASS
 fi
 
-wait ; wait
-
+wait
+wait
 
 # generate the correct output
 ../mrsequential ../../mrapps/nocrash.so ../pg*txt || exit 1
-sort mr-out-0 > mr-correct-crash.txt
+sort mr-out-0 >mr-correct-crash.txt
 rm -f mr-out*
 
 echo '***' Starting crash test.
 
 rm -f mr-done
-(timeout -k 2s 180s ../mrmaster ../pg*txt ; touch mr-done ) &
+(
+	timeout -k 2s 180s ../mrmaster ../pg*txt
+	touch mr-done
+) &
 sleep 1
 
 # start multiple workers
 timeout -k 2s 180s ../mrworker ../../mrapps/crash.so &
 
 # mimic rpc.go's masterSock()
-SOCKNAME=/var/tmp/824-mr-`id -u`
+SOCKNAME=/var/tmp/824-mr-$(id -u)
 
-( while [ -e $SOCKNAME -a ! -f mr-done ]
-  do
-    timeout -k 2s 180s ../mrworker ../../mrapps/crash.so
-    sleep 1
-  done ) &
+(while [ -e $SOCKNAME -a ! -f mr-done ]; do
+	timeout -k 2s 180s ../mrworker ../../mrapps/crash.so
+	sleep 1
+done) &
 
-( while [ -e $SOCKNAME -a ! -f mr-done ]
-  do
-    timeout -k 2s 180s ../mrworker ../../mrapps/crash.so
-    sleep 1
-  done ) &
+(while [ -e $SOCKNAME -a ! -f mr-done ]; do
+	timeout -k 2s 180s ../mrworker ../../mrapps/crash.so
+	sleep 1
+done) &
 
-while [ -e $SOCKNAME -a ! -f mr-done ]
-do
-  timeout -k 2s 180s ../mrworker ../../mrapps/crash.so
-  sleep 1
+while [ -e $SOCKNAME -a ! -f mr-done ]; do
+	timeout -k 2s 180s ../mrworker ../../mrapps/crash.so
+	sleep 1
 done
 
 wait
@@ -192,19 +191,18 @@ wait
 wait
 
 rm $SOCKNAME
-sort mr-out* | grep . > mr-crash-all
-if cmp mr-crash-all mr-correct-crash.txt
-then
-  echo '---' crash test: PASS
+sort mr-out* | grep . >mr-crash-all
+if cmp mr-crash-all mr-correct-crash.txt; then
+	echo '---' crash test: PASS
 else
-  echo '---' crash output is not the same as mr-correct-crash.txt
-  echo '---' crash test: FAIL
-  failed_any=1
+	echo '---' crash output is not the same as mr-correct-crash.txt
+	echo '---' crash test: FAIL
+	failed_any=1
 fi
 
 if [ $failed_any -eq 0 ]; then
-    echo '***' PASSED ALL TESTS
+	echo '***' PASSED ALL TESTS
 else
-    echo '***' FAILED SOME TESTS
-    exit 1
+	echo '***' FAILED SOME TESTS
+	exit 1
 fi
