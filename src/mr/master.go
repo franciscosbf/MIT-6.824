@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 const timeout = time.Second * 10
@@ -20,6 +22,40 @@ const (
 	reduceFiles
 )
 
+func masterInfo(wid int, format string, v ...interface{}) {
+	format = fmt.Sprintf("master %v: %v", wid, format)
+	log.Printf(format, v...)
+}
+
+type atomicBool struct {
+	b uint32
+}
+
+func (ab *atomicBool) load() bool {
+	return atomic.LoadUint32(&ab.b) == 1
+}
+
+func (ab *atomicBool) set(b bool) {
+	if b {
+		atomic.StoreUint32(&ab.b, 1)
+	} else {
+		atomic.StoreUint32(&ab.b, 0)
+	}
+}
+
+func (ab *atomicBool) compareAndSwap(old bool, new bool) bool {
+	var ov, nv uint32
+
+	if old {
+		ov = 1
+	}
+	if new {
+		nv = 1
+	}
+
+	return atomic.CompareAndSwapUint32(&ab.b, ov, nv)
+}
+
 type task struct {
 	input []string
 	wt    workType
@@ -27,12 +63,12 @@ type task struct {
 
 type worker struct {
 	beat chan struct{}
-	dead atomic.Bool
+	dead atomicBool
 
 	intermidiateDone chan struct{}
 
 	wid int
-	tk  atomic.Pointer[task]
+	tk  unsafe.Pointer
 }
 
 func newWorker(wid int) *worker {
@@ -51,23 +87,23 @@ func (w *worker) alive() {
 }
 
 func (w *worker) setTaskMarker(tk *task) {
-	w.tk.Store(tk)
+	atomic.StorePointer(&w.tk, unsafe.Pointer(tk))
 }
 
 func (w *worker) removeTaskMarker() {
-	w.tk.Store(nil)
+	atomic.StorePointer(&w.tk, unsafe.Pointer(nil))
 }
 
 func (w *worker) setDead() {
-	w.dead.Store(true)
+	w.dead.set(true)
 }
 
 func (w *worker) isDead() bool {
-	return w.dead.Load()
+	return w.dead.load()
 }
 
 func (w *worker) reborn(m *Master) {
-	if !w.dead.CompareAndSwap(true, false) {
+	if !w.dead.compareAndSwap(true, false) {
 		return
 	}
 
@@ -90,9 +126,10 @@ func (w *worker) heartbeat(m *Master) {
 					m.finalize()
 				}
 
-				if wtk := w.tk.Load(); wtk != nil {
-					w.tk.CompareAndSwap(wtk, nil)
+				if ptr := atomic.LoadPointer(&w.tk); ptr != nil {
+					atomic.CompareAndSwapPointer(&w.tk, ptr, nil)
 
+					wtk := (*task)(ptr)
 					switch wtk.wt {
 					case mapFile:
 						m.rescheduleMapping(wtk.input[0])
@@ -122,7 +159,7 @@ func (w *worker) alertIntermidiateDone() {
 
 type workers struct {
 	wks        map[int]*worker
-	registered atomic.Int64
+	registered int64
 
 	sync.RWMutex
 }
@@ -138,7 +175,7 @@ func (w *workers) gen() *worker {
 	nw := newWorker(len(w.wks))
 	w.wks[nw.wid] = nw
 
-	w.registered.Add(1)
+	atomic.AddInt64(&w.registered, 1)
 
 	return nw
 }
@@ -164,7 +201,7 @@ func (w *workers) interate(f func(*worker)) {
 }
 
 func (w *workers) registeredWorkers() int64 {
-	return w.registered.Load()
+	return atomic.LoadInt64(&w.registered)
 }
 
 type mapping = string
@@ -244,7 +281,7 @@ func (r *reductions) pop() (reduction, bool) {
 }
 
 type counter struct {
-	c atomic.Int64
+	c int64
 }
 
 func newCounter() *counter {
@@ -252,27 +289,27 @@ func newCounter() *counter {
 }
 
 func (bc *counter) set(v int) {
-	bc.c.Store(int64(v))
+	atomic.StoreInt64(&bc.c, int64(v))
 }
 
 func (bc *counter) add(v int) {
-	bc.c.Add(int64(v))
+	atomic.AddInt64(&bc.c, int64(v))
 }
 
 func (bc *counter) inc() {
-	bc.c.Add(1)
+	atomic.AddInt64(&bc.c, 1)
 }
 
 func (bc *counter) dec() {
-	bc.c.Add(-1)
+	atomic.AddInt64(&bc.c, -1)
 }
 
 func (bc *counter) zeroed() bool {
-	return bc.c.Load() <= 0
+	return bc.get() <= 0
 }
 
 func (bc *counter) get() int64 {
-	return bc.c.Load()
+	return atomic.LoadInt64(&bc.c)
 }
 
 type punchCard struct {
@@ -289,7 +326,7 @@ func (t *punchCard) set(wid int) int64 {
 	t.Lock()
 	defer t.Unlock()
 
-	id := time.Now().UnixMicro()
+	id := time.Now().UnixNano()
 	t.ids[wid] = id
 
 	return id
@@ -330,7 +367,7 @@ type Master struct {
 
 	intermidiateDone chan struct{}
 	doneAlert        chan struct{}
-	done             atomic.Bool
+	done             atomicBool
 
 	workers *workers
 	batchSz int
@@ -627,7 +664,7 @@ func (m *Master) checkMarkReductions() {
 }
 
 func (m *Master) finished() bool {
-	return m.done.Load()
+	return m.done.load()
 }
 
 func (m *Master) areMappingsDone() bool {
@@ -642,7 +679,7 @@ func (m *Master) alertMappingsDone() {
 }
 
 func (m *Master) finalize() {
-	if !m.done.CompareAndSwap(false, true) {
+	if !m.done.compareAndSwap(false, true) {
 		return
 	}
 

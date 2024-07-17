@@ -37,12 +37,12 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-func die(wid int, format string, v ...any) {
+func workerDie(wid int, format string, v ...interface{}) {
 	format = fmt.Sprintf("worker %v: %v", wid, format)
 	log.Fatalf(format, v...)
 }
 
-func info(wid int, format string, v ...any) {
+func workerInfo(wid int, format string, v ...interface{}) {
 	format = fmt.Sprintf("worker %v: %v", wid, format)
 	log.Printf(format, v...)
 }
@@ -68,7 +68,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		wid = reply.Wid
 		batchSz = reply.BatchSz
 
-		info(wid, "registered with batch size of %v", batchSz)
+		workerInfo(wid, "registered with batch size of %v", batchSz)
 	}
 
 mapping:
@@ -82,15 +82,15 @@ mapping:
 			file = reply.File
 			tkId = reply.TkId
 
-			info(wid, "proceeding to map %v (task id %v)", file, tkId)
+			workerInfo(wid, "proceeding to map %v (task id %v)", file, tkId)
 
 			f, err := os.Open(file)
 			if err != nil {
-				die(wid, "cannot open %v\n", file)
+				workerDie(wid, "cannot open %v: %v\n", file, err)
 			}
 			content, err := ioutil.ReadAll(f)
 			if err != nil {
-				die(wid, "cannot read %v\n", file)
+				workerDie(wid, "cannot read %v: %v\n", file, err)
 			}
 			f.Close()
 
@@ -106,7 +106,7 @@ mapping:
 					tmpFilename := fmt.Sprintf("%v-*", filename)
 					f, err = ioutil.TempFile("", tmpFilename)
 					if err != nil {
-						die(wid, "cannot open tmp file %v\n", tmpFilename)
+						workerDie(wid, "cannot open tmp file %v: %v\n", tmpFilename, err)
 					}
 					buckets[bktid] = &bucket{
 						filename: filename,
@@ -114,17 +114,17 @@ mapping:
 					}
 				}
 				if _, err = fmt.Fprintf(f, "%v %v\n", p.Key, p.Value); err != nil {
-					die(wid, "cannot write to %v\n", f.Name())
+					workerDie(wid, "cannot write to %v: %v\n", f.Name(), err)
 				}
 			}
 
 			for btkid, b := range buckets {
 				if b != nil {
-					err := os.Rename(b.f.Name(), b.filename)
-					if err != nil {
-						die(wid, "cannot rename %v to %v\n", b.f.Name(), b.filename)
-					}
 					b.f.Close()
+
+					if err := os.Rename(b.f.Name(), b.filename); err != nil {
+						workerDie(wid, "cannot rename %v to %v: %v\n", b.f.Name(), b.filename, err)
+					}
 				}
 				it := Intermidiate{
 					File: b.filename,
@@ -133,13 +133,13 @@ mapping:
 				intermidiates = append(intermidiates, it)
 			}
 		case IntermidiateDone:
-			info(wid, "intermidiate step is done")
+			workerInfo(wid, "intermidiate step is done")
 			goto reduction
 		case InvalidWorkerId:
-			info(wid, "got invalid worker id while trying to request a mapping")
+			workerInfo(wid, "got invalid worker id while trying to request a mapping")
 			return
 		case Finished:
-			info(wid, "got finished while trying to request a mapping")
+			workerInfo(wid, "got finished while trying to request a mapping")
 			return
 		}
 	}
@@ -153,18 +153,18 @@ mapping:
 		call("Master.MappingDone", &args, &reply)
 		switch reply.Response {
 		case Accepted | IntermidiateDone:
-			info(wid, "delivered intermidiate files %v (task id %v) and this phase has finished", intermidiates, tkId)
+			workerInfo(wid, "delivered intermidiate files %v (task id %v) and this phase has finished", intermidiates, tkId)
 		case Accepted:
-			info(wid, "delivered intermidiate files %v (task id %v)", intermidiates, tkId)
+			workerInfo(wid, "delivered intermidiate files %v (task id %v)", intermidiates, tkId)
 			goto mapping
 		case InvalidTaskId:
-			info(wid, "mapping of %v (old task id %v) was already reassigned", file, tkId)
+			workerInfo(wid, "mapping of %v (old task id %v) was already reassigned", file, tkId)
 			goto mapping
 		case InvalidWorkerId:
-			info(wid, "got invalid worker id while trying to deliver intermidiate files %v (task id %v)", intermidiates, tkId)
+			workerInfo(wid, "got invalid worker id while trying to deliver intermidiate files %v (task id %v)", intermidiates, tkId)
 			return
 		case Finished:
-			info(wid, "got finished while trying to deliver intermidiate files %v (task id %v)", intermidiates, tkId)
+			workerInfo(wid, "got finished while trying to deliver intermidiate files %v (task id %v)", intermidiates, tkId)
 			return
 		}
 	}
@@ -179,7 +179,7 @@ reduction:
 			files = reply.Files
 			tkId = reply.TkId
 
-			info(wid, "proceeding to reduce %v (task id %v)", files, tkId)
+			workerInfo(wid, "proceeding to reduce %v (task id %v)", files, tkId)
 
 			var nWorkers int
 
@@ -199,7 +199,7 @@ reduction:
 				nWorkers = nCpus
 			}
 
-			for range nWorkers {
+			for i := nWorkers; i > 0; i-- {
 				go func(
 					jobs <-chan string,
 					prereduction chan<- []KeyValue,
@@ -216,13 +216,13 @@ reduction:
 
 						f, err := os.Open(file)
 						if err != nil {
-							die(wid, "cannot open %v\n", file)
+							workerDie(wid, "cannot open %v: %v\n", file, err)
 							prereduction <- nil
 							return
 						}
 						content, err := ioutil.ReadAll(f)
 						if err != nil {
-							die(wid, "cannot read %v\n", file)
+							workerDie(wid, "cannot read %v: %v\n", file, err)
 							prereduction <- nil
 							return
 						}
@@ -262,7 +262,7 @@ reduction:
 				}(jobs, prereduction)
 			}
 
-			for range nFiles {
+			for i := nFiles; i > 0; i-- {
 				kvs = append(kvs, <-prereduction...)
 			}
 			close(jobs)
@@ -271,7 +271,7 @@ reduction:
 			tmpFilename := fmt.Sprintf("%v-*", filename)
 			f, err := ioutil.TempFile("", tmpFilename)
 			if err != nil {
-				die(wid, "cannot open tmp file %v\n", tmpFilename)
+				workerDie(wid, "cannot open tmp file %v: %v\n", tmpFilename, err)
 			}
 
 			sort.Sort(ByKey(kvs))
@@ -290,21 +290,22 @@ reduction:
 				output := reducef(kvs[i].Key, values)
 
 				if _, err := fmt.Fprintf(f, "%v %v\n", kvs[i].Key, output); err != nil {
-					die(wid, "cannot write to %v\n", f.Name())
+					workerDie(wid, "cannot write to %v: %v\n", f.Name(), err)
 				}
 
 				i = j
 			}
 
-			if err = os.Rename(f.Name(), filename); err != nil {
-				die(wid, "cannot rename %v to %v\n", f.Name(), filename)
-			}
 			f.Close()
+
+			if err = os.Rename(f.Name(), filename); err != nil {
+				workerDie(wid, "cannot rename %v to %v: %v\n", f.Name(), filename, err)
+			}
 		case InvalidWorkerId:
-			info(wid, "got invalid worker id while trying to request a reduction")
+			workerInfo(wid, "got invalid worker id while trying to request a reduction")
 			return
 		case Finished:
-			info(wid, "got finished while trying to request a reduction")
+			workerInfo(wid, "got finished while trying to request a reduction")
 			return
 		}
 	}
@@ -317,17 +318,17 @@ reduction:
 		call("Master.ReductionDone", &args, &reply)
 		switch reply.Response {
 		case Accepted | Finished:
-			info(wid, "signaled completed reduction (task id %v) and the program as finished", tkId)
+			workerInfo(wid, "signaled completed reduction (task id %v) and the program as finished", tkId)
 		case Accepted:
-			info(wid, "signaled completed reduction (task id %v)", tkId)
+			workerInfo(wid, "signaled completed reduction (task id %v)", tkId)
 			goto reduction
 		case InvalidTaskId:
-			info(wid, "reduction of %v (old task id %v) was already reassigned", files, tkId)
+			workerInfo(wid, "reduction of %v (old task id %v) was already reassigned", files, tkId)
 			goto reduction
 		case InvalidWorkerId:
-			info(wid, "got invalid worker id while trying to signaling completed reduction (task id %v)", intermidiates, tkId)
+			workerInfo(wid, "got invalid worker id while trying to signaling completed reduction (task id %v)", intermidiates, tkId)
 		case Finished:
-			info(wid, "got finished while trying to signaling completed reduction (task id %v)", intermidiates, tkId)
+			workerInfo(wid, "got finished while trying to signaling completed reduction (task id %v)", intermidiates, tkId)
 		}
 	}
 }
@@ -335,7 +336,7 @@ reduction:
 // send an RPC request to the master, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-func call(rpcname string, args any, reply any) {
+func call(rpcname string, args interface{}, reply interface{}) {
 	sockname := masterSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
