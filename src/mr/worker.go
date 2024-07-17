@@ -107,14 +107,12 @@ mapping:
 					if err != nil {
 						log.Fatalf("cannot open tmp file %v\n", tmpFilename)
 					}
-					b = &bucket{
+					buckets[bktid] = &bucket{
 						filename: filename,
 						f:        f,
 					}
-					buckets[bktid] = b
 				}
-				_, err = fmt.Fprintf(f, "%v %v\n", p.Key, p.Value)
-				if err != nil {
+				if _, err = fmt.Fprintf(f, "%v %v\n", p.Key, p.Value); err != nil {
 					log.Fatalf("cannot write to %v\n", f.Name())
 				}
 			}
@@ -132,12 +130,6 @@ mapping:
 					Rid:  btkid,
 				}
 				intermidiates = append(intermidiates, it)
-			}
-
-			for _, b := range buckets {
-				if b.f != nil {
-					b.f.Close()
-				}
 			}
 		case IntermidiateDone:
 			goto reduction
@@ -298,8 +290,7 @@ reduction:
 				i = j
 			}
 
-			err = os.Rename(f.Name(), filename)
-			if err != nil {
+			if err = os.Rename(f.Name(), filename); err != nil {
 				log.Fatalf("cannot rename %v to %v\n", f.Name(), filename)
 			}
 			f.Close()
@@ -340,11 +331,11 @@ func call(rpcname string, args any, reply any) {
 	sockname := masterSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatalf("dialing: ", err)
+		log.Fatal("dialing: ", err)
 	}
 	defer c.Close()
 
 	if err := c.Call(rpcname, args, reply); err != nil {
-		log.Fatalf("calling: ", err)
+		log.Fatal("calling: ", err)
 	}
 }
