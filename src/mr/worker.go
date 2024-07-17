@@ -38,7 +38,7 @@ func ihash(key string) int {
 }
 
 func die(wid int, format string, v ...any) {
-	format = fmt.Sprintf("%v: %v", wid, format)
+	format = fmt.Sprintf("worker %v: %v", wid, format)
 	log.Fatalf(format, v...)
 }
 
