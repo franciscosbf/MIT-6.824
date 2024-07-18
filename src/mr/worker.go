@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io/ioutil"
@@ -9,7 +10,6 @@ import (
 	"os"
 	"runtime"
 	"sort"
-	"strings"
 )
 
 // Map functions return a slice of KeyValue.
@@ -27,6 +27,7 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 type bucket struct {
 	f        *os.File
 	filename string
+	kvs      []KeyValue
 }
 
 // use ihash(key) % NReduce to choose the reduce
@@ -81,6 +82,7 @@ mapping:
 			intermidiates = nil
 			file = reply.File
 			tkId = reply.TkId
+			mId := reply.Id
 
 			workerInfo(wid, "proceeding to map %v (task id %v)", file, tkId)
 
@@ -102,30 +104,36 @@ mapping:
 				bktid := ihash(p.Key) % batchSz
 				b := buckets[bktid]
 				if b == nil {
-					filename := fmt.Sprintf("mr-%v-%v", wid, bktid)
+					filename := fmt.Sprintf("mr-%v-%v", mId, bktid)
 					tmpFilename := fmt.Sprintf("%v-*", filename)
-					f, err = ioutil.TempFile("", tmpFilename)
+					f, err = ioutil.TempFile(".", tmpFilename)
 					if err != nil {
 						workerDie(wid, "cannot open tmp file %v: %v\n", tmpFilename, err)
 					}
-					buckets[bktid] = &bucket{
+					b = &bucket{
 						filename: filename,
 						f:        f,
 					}
+					buckets[bktid] = b
 				}
-				if _, err = fmt.Fprintf(f, "%v %v\n", p.Key, p.Value); err != nil {
-					workerDie(wid, "cannot write to %v: %v\n", f.Name(), err)
-				}
+				b.kvs = append(b.kvs, p)
 			}
 
 			for btkid, b := range buckets {
-				if b != nil {
-					b.f.Close()
-
-					if err := os.Rename(b.f.Name(), b.filename); err != nil {
-						workerDie(wid, "cannot rename %v to %v: %v\n", b.f.Name(), b.filename, err)
-					}
+				if b == nil {
+					continue
 				}
+
+				bts, err := json.Marshal(b.kvs)
+				if err != nil {
+					workerDie(wid, "cannot marshal key-value pairs")
+				}
+				b.f.Write(bts)
+				b.f.Close()
+				if err := os.Rename(b.f.Name(), b.filename); err != nil {
+					workerDie(wid, "cannot rename %v to %v: %v\n", b.f.Name(), b.filename, err)
+				}
+
 				it := Intermidiate{
 					File: b.filename,
 					Rid:  btkid,
@@ -178,6 +186,7 @@ reduction:
 		case ToDo:
 			files = reply.Files
 			tkId = reply.TkId
+			rId := reply.Id
 
 			workerInfo(wid, "proceeding to reduce %v (task id %v)", files, tkId)
 
@@ -187,7 +196,7 @@ reduction:
 			nCpus := runtime.NumCPU()
 			jobs := make(chan string, nFiles)
 			prereduction := make(chan []KeyValue, nFiles)
-			kvs := []KeyValue{}
+			finalKvs := []KeyValue{}
 
 			for _, file := range files {
 				jobs <- file
@@ -228,68 +237,43 @@ reduction:
 						}
 						f.Close()
 
-						lines := strings.Split(string(content), "\n")
-						nLines := len(lines) - 1
-						kvs := make([]KeyValue, nLines)
-						for i, line := range lines[:nLines] {
-							ls := strings.Split(line, " ")
-							kvs[i] = KeyValue{Key: ls[0], Value: ls[1]}
+						kvs := []KeyValue{}
+						if err := json.Unmarshal(content, &kvs); err != nil {
+							workerDie(wid, "cannot unmarshal key-value pairs")
 						}
-						sort.Sort(ByKey(kvs))
-
-						prevKvs := []KeyValue{}
-						nKvs := len(kvs)
-						i := 0
-						for i < nKvs {
-							j := i + 1
-							for j < nKvs && kvs[j].Key == kvs[i].Key {
-								j++
-							}
-
-							values := []string{}
-							for k := i; k < j; k++ {
-								values = append(values, kvs[k].Value)
-							}
-							output := reducef(kvs[i].Key, values)
-
-							kv := KeyValue{Key: kvs[i].Key, Value: output}
-							prevKvs = append(prevKvs, kv)
-
-							i = j
-						}
-						prereduction <- prevKvs
+						prereduction <- kvs
 					}
 				}(jobs, prereduction)
 			}
 
 			for i := nFiles; i > 0; i-- {
-				kvs = append(kvs, <-prereduction...)
+				finalKvs = append(finalKvs, (<-prereduction)...)
 			}
 			close(jobs)
 
-			filename := fmt.Sprintf("mr-out-%d", wid)
+			filename := fmt.Sprintf("mr-out-%d", rId)
 			tmpFilename := fmt.Sprintf("%v-*", filename)
-			f, err := ioutil.TempFile("", tmpFilename)
+			f, err := ioutil.TempFile(".", tmpFilename)
 			if err != nil {
 				workerDie(wid, "cannot open tmp file %v: %v\n", tmpFilename, err)
 			}
 
-			sort.Sort(ByKey(kvs))
-			nKvs := len(kvs)
+			sort.Sort(ByKey(finalKvs))
+			nKvs := len(finalKvs)
 			i := 0
 			for i < nKvs {
 				j := i + 1
-				for j < nKvs && kvs[j].Key == kvs[i].Key {
+				for j < nKvs && finalKvs[j].Key == finalKvs[i].Key {
 					j++
 				}
 
 				values := []string{}
 				for k := i; k < j; k++ {
-					values = append(values, kvs[k].Value)
+					values = append(values, finalKvs[k].Value)
 				}
-				output := reducef(kvs[i].Key, values)
+				output := reducef(finalKvs[i].Key, values)
 
-				if _, err := fmt.Fprintf(f, "%v %v\n", kvs[i].Key, output); err != nil {
+				if _, err := fmt.Fprintf(f, "%v %v\n", finalKvs[i].Key, output); err != nil {
 					workerDie(wid, "cannot write to %v: %v\n", f.Name(), err)
 				}
 

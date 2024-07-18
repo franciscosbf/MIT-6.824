@@ -41,6 +41,7 @@ type MappingRequestReply struct {
 	File     string
 	TkId     int64
 	Response DeliveryResponse
+	Id       int
 }
 
 type MappingDoneArgs struct {
@@ -61,6 +62,7 @@ type ReductionRequestReply struct {
 	Files    []string
 	TkId     int64
 	Response DeliveryResponse
+	Id       int
 }
 
 type ReductionDoneArgs struct {

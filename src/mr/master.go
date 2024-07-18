@@ -57,15 +57,14 @@ func (ab *atomicBool) compareAndSwap(old bool, new bool) bool {
 }
 
 type task struct {
-	input []string
-	wt    workType
+	m  mapping
+	r  reduction
+	wt workType
 }
 
 type worker struct {
 	beat chan struct{}
 	dead atomicBool
-
-	intermidiateDone chan struct{}
 
 	wid int
 	tk  unsafe.Pointer
@@ -73,9 +72,8 @@ type worker struct {
 
 func newWorker(wid int) *worker {
 	return &worker{
-		beat:             make(chan struct{}, 1),
-		wid:              wid,
-		intermidiateDone: make(chan struct{}, 1),
+		beat: make(chan struct{}, 1),
+		wid:  wid,
 	}
 }
 
@@ -132,9 +130,9 @@ func (w *worker) heartbeat(m *Master) {
 					wtk := (*task)(ptr)
 					switch wtk.wt {
 					case mapFile:
-						m.rescheduleMapping(wtk.input[0])
+						m.rescheduleMapping(wtk.m)
 					case reduceFiles:
-						m.rescheduleReduction(wtk.input)
+						m.rescheduleReduction(wtk.r)
 					}
 				}
 
@@ -148,13 +146,6 @@ func (w *worker) heartbeat(m *Master) {
 			}
 		}
 	}()
-}
-
-func (w *worker) alertIntermidiateDone() {
-	select {
-	case w.intermidiateDone <- struct{}{}:
-	default:
-	}
 }
 
 type workers struct {
@@ -204,10 +195,14 @@ func (w *workers) registeredWorkers() int64 {
 	return atomic.LoadInt64(&w.registered)
 }
 
-type mapping = string
+type mapping struct {
+	file string
+	id   int
+}
 
 type mappings struct {
 	files []string
+	next  int
 
 	sync.Mutex
 }
@@ -225,20 +220,30 @@ func (m *mappings) pop() (mapping, bool) {
 	defer m.Unlock()
 
 	if len(m.files) == 0 {
-		return "", false
+		return mapping{}, false
 	}
 
 	file := m.files[0]
 	m.files = m.files[1:]
 
-	return file, true
+	mfile := mapping{
+		file: file,
+		id:   m.next,
+	}
+
+	m.next++
+
+	return mfile, true
 }
 
-type reduction = []string
+type reduction struct {
+	files []string
+	id    int
+}
 
 type reductions struct {
 	cache         map[int]int
-	intermidiates [][]string
+	intermidiates []reduction
 
 	sync.Mutex
 }
@@ -255,10 +260,13 @@ func (r *reductions) append(files []Intermidiate) int {
 
 	for _, inf := range files {
 		if idx, ok := r.cache[inf.Rid]; ok {
-			r.intermidiates[idx] = append(r.intermidiates[idx], inf.File)
+			r.intermidiates[idx].files = append(r.intermidiates[idx].files, inf.File)
 		} else {
 			r.cache[inf.Rid] = len(r.intermidiates)
-			r.intermidiates = append(r.intermidiates, []string{inf.File})
+			r.intermidiates = append(r.intermidiates, reduction{
+				id:    len(r.intermidiates),
+				files: []string{inf.File},
+			})
 			newBatches++
 		}
 	}
@@ -271,7 +279,7 @@ func (r *reductions) pop() (reduction, bool) {
 	defer r.Unlock()
 
 	if len(r.intermidiates) == 0 {
-		return nil, false
+		return reduction{}, false
 	}
 
 	intermidiates := r.intermidiates[0]
@@ -365,9 +373,11 @@ type Master struct {
 	rMappings   chan mapping
 	rReductions chan reduction
 
-	intermidiateDone chan struct{}
-	doneAlert        chan struct{}
-	done             atomicBool
+	intermidiateDone   chan struct{}
+	intermidiateSignal chan struct{}
+	programDone        chan struct{}
+	exitSignal         chan struct{}
+	done               atomicBool
 
 	workers *workers
 	batchSz int
@@ -411,34 +421,32 @@ func (m *Master) MappingRequest(
 		return
 	}
 
-	if file, has := m.mappings.pop(); has {
-		tkId := m.pinNewTask(args.Wid)
+	var (
+		mfile mapping
+		has   bool
+	)
 
-		tk := &task{
-			input: []string{file},
-			wt:    mapFile,
-		}
-		w.setTaskMarker(tk)
-
-		*reply = MappingRequestReply{
-			File:     file,
-			TkId:     tkId,
-			Response: ToDo,
-		}
+	if mfile, has = m.mappings.pop(); has {
+	} else if mfile, has = m.lookupMappingTask(); has {
+	} else {
+		*reply = MappingRequestReply{Response: IntermidiateDone}
 
 		return
 	}
 
-	if file, hasMore := m.lookupMappingTask(w); hasMore {
-		tkId := m.pinNewTask(args.Wid)
+	tkId := m.pinNewTask(args.Wid)
 
-		*reply = MappingRequestReply{
-			File:     file,
-			TkId:     tkId,
-			Response: ToDo,
-		}
-	} else {
-		*reply = MappingRequestReply{Response: IntermidiateDone}
+	tk := &task{
+		m:  mfile,
+		wt: mapFile,
+	}
+	w.setTaskMarker(tk)
+
+	*reply = MappingRequestReply{
+		Id:       mfile.id,
+		File:     mfile.file,
+		TkId:     tkId,
+		Response: ToDo,
 	}
 
 	return
@@ -507,34 +515,32 @@ func (m *Master) ReductionRequest(
 		return
 	}
 
-	if files, has := m.reductions.pop(); has {
-		tkId := m.pinNewTask(args.Wid)
+	var (
+		rfiles reduction
+		has    bool
+	)
 
-		tk := &task{
-			input: files,
-			wt:    mapFile,
-		}
-		w.setTaskMarker(tk)
-
-		*reply = ReductionRequestReply{
-			Files:    files,
-			TkId:     tkId,
-			Response: ToDo,
-		}
+	if rfiles, has = m.reductions.pop(); has {
+	} else if rfiles, has = m.lookupReductionTask(); has {
+	} else {
+		*reply = ReductionRequestReply{Response: Finished}
 
 		return
 	}
 
-	if files, hasMore := m.lookupReductionTask(); hasMore {
-		tkId := m.pinNewTask(args.Wid)
+	tkId := m.pinNewTask(args.Wid)
 
-		*reply = ReductionRequestReply{
-			Files:    files,
-			TkId:     tkId,
-			Response: ToDo,
-		}
-	} else {
-		*reply = ReductionRequestReply{Response: Finished}
+	tk := &task{
+		r:  rfiles,
+		wt: mapFile,
+	}
+	w.setTaskMarker(tk)
+
+	*reply = ReductionRequestReply{
+		Id:       rfiles.id,
+		Files:    rfiles.files,
+		TkId:     tkId,
+		Response: ToDo,
 	}
 
 	return
@@ -578,16 +584,16 @@ func (m *Master) ReductionDone(
 	return
 }
 
-func (m *Master) lookupMappingTask(w *worker) (mapping, bool) {
+func (m *Master) lookupMappingTask() (mapping, bool) {
 	if !m.mappingsC.zeroed() {
 		select {
-		case file := <-m.rMappings:
-			return file, true
-		case <-w.intermidiateDone:
+		case mfile := <-m.rMappings:
+			return mfile, true
+		case <-m.intermidiateSignal:
 		}
 	}
 
-	return "", false
+	return mapping{}, false
 }
 
 func (m *Master) lookupReductionTask() (reduction, bool) {
@@ -595,12 +601,11 @@ func (m *Master) lookupReductionTask() (reduction, bool) {
 		select {
 		case files := <-m.rReductions:
 			return files, true
-		case <-m.doneAlert:
-			close(m.doneAlert)
+		case <-m.exitSignal:
 		}
 	}
 
-	return []string{}, false
+	return reduction{}, false
 }
 
 func (m *Master) storeIntermidiates(intermidiates []Intermidiate) {
@@ -620,12 +625,12 @@ func (m *Master) forceUnpin(wid int) {
 	m.pcard.forceRemove(wid)
 }
 
-func (m *Master) rescheduleMapping(file string) {
-	m.rMappings <- file
+func (m *Master) rescheduleMapping(mfile mapping) {
+	m.rMappings <- mfile
 }
 
-func (m *Master) rescheduleReduction(files []string) {
-	m.rReductions <- files
+func (m *Master) rescheduleReduction(rfiles reduction) {
+	m.rReductions <- rfiles
 }
 
 func (m *Master) checkWorkerState(wid int) (*worker, bool) {
@@ -649,9 +654,15 @@ func (m *Master) intermidiateVigilant() {
 	go func() {
 		<-m.intermidiateDone
 
-		m.workers.interate(func(w *worker) {
-			w.alertIntermidiateDone()
-		})
+		close(m.intermidiateSignal)
+	}()
+}
+
+func (m *Master) endVigilant() {
+	go func() {
+		<-m.programDone
+
+		close(m.exitSignal)
 	}()
 }
 
@@ -684,7 +695,7 @@ func (m *Master) finalize() {
 	}
 
 	select {
-	case m.doneAlert <- struct{}{}:
+	case m.programDone <- struct{}{}:
 	default:
 	}
 }
@@ -726,8 +737,7 @@ func (m *Master) server() {
 func (m *Master) Done() bool {
 	// Your code here.
 	select {
-	case <-m.doneAlert:
-		close(m.doneAlert)
+	case <-m.exitSignal:
 		return true
 	default:
 		return false
@@ -752,8 +762,10 @@ func MakeMaster(files []string, nReduce int) *Master {
 		rMappings:   make(chan mapping, batchTasks),
 		rReductions: make(chan reduction, batchTasks),
 
-		intermidiateDone: make(chan struct{}, 1),
-		doneAlert:        make(chan struct{}, 1),
+		intermidiateDone:   make(chan struct{}, 1),
+		intermidiateSignal: make(chan struct{}),
+		programDone:        make(chan struct{}, 1),
+		exitSignal:         make(chan struct{}),
 
 		workers: newWorkers(),
 		batchSz: nReduce,
@@ -761,6 +773,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 
 	m.mappingsC.add(batchTasks)
 	m.intermidiateVigilant()
+	m.endVigilant()
 
 	m.server()
 
