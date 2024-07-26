@@ -49,15 +49,17 @@ package labrpc
 //   pass svc to srv.AddService()
 //
 
-import "../labgob"
-import "bytes"
-import "reflect"
-import "sync"
-import "log"
-import "strings"
-import "math/rand"
-import "time"
-import "sync/atomic"
+import (
+	"../labgob"
+	"bytes"
+	"log"
+	"math/rand"
+	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
 
 type reqMsg struct {
 	endname  interface{} // name of sending ClientEnd
@@ -303,7 +305,6 @@ func (rn *Network) processReq(req reqMsg) {
 			req.replyCh <- replyMsg{false, nil}
 		})
 	}
-
 }
 
 // create a client end-point.
@@ -377,11 +378,9 @@ func (rn *Network) GetTotalBytes() int64 {
 	return x
 }
 
-//
 // a server is a collection of services, all sharing
 // the same rpc dispatcher. so that e.g. both a Raft
 // and a k/v server can listen to the same rpc endpoint.
-//
 type Server struct {
 	mu       sync.Mutex
 	services map[string]*Service
@@ -418,7 +417,7 @@ func (rs *Server) dispatch(req reqMsg) replyMsg {
 		return service.dispatch(methodName, req)
 	} else {
 		choices := []string{}
-		for k, _ := range rs.services {
+		for k := range rs.services {
 			choices = append(choices, k)
 		}
 		log.Fatalf("labrpc.Server.dispatch(): unknown service %v in %v.%v; expecting one of %v\n",
@@ -454,16 +453,16 @@ func MakeService(rcvr interface{}) *Service {
 		mtype := method.Type
 		mname := method.Name
 
-		//fmt.Printf("%v pp %v ni %v 1k %v 2k %v no %v\n",
+		// fmt.Printf("%v pp %v ni %v 1k %v 2k %v no %v\n",
 		//	mname, method.PkgPath, mtype.NumIn(), mtype.In(1).Kind(), mtype.In(2).Kind(), mtype.NumOut())
 
 		if method.PkgPath != "" || // capitalized?
 			mtype.NumIn() != 3 ||
-			//mtype.In(1).Kind() != reflect.Ptr ||
+			// mtype.In(1).Kind() != reflect.Ptr ||
 			mtype.In(2).Kind() != reflect.Ptr ||
 			mtype.NumOut() != 0 {
 			// the method is not suitable for a handler
-			//fmt.Printf("bad method: %v\n", mname)
+			// fmt.Printf("bad method: %v\n", mname)
 		} else {
 			// the method looks like a handler
 			svc.methods[mname] = method
@@ -501,7 +500,7 @@ func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
 		return replyMsg{true, rb.Bytes()}
 	} else {
 		choices := []string{}
-		for k, _ := range svc.methods {
+		for k := range svc.methods {
 			choices = append(choices, k)
 		}
 		log.Fatalf("labrpc.Service.dispatch(): unknown method %v in %v; expecting one of %v\n",
