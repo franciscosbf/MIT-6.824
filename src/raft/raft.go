@@ -185,16 +185,17 @@ func (rf *Raft) fireHeartbeat() {
 			reply := AppendEntriesReply{}
 
 			for retries := heartbeatRetries; retries > 0; retries-- {
-				if peer.Call("AppendEntries", &args, &reply) {
-					if reply.Success {
-						rf.mu.Lock()
-						if reply.Term > rf.currentTerm {
-							rf.currentTerm = reply.Term
-						}
-						rf.mu.Unlock()
-					}
-					return
+				if !peer.Call("AppendEntries", &args, &reply) {
+					continue
 				}
+
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					rf.revertToFollower(args.Term)
+				}
+				rf.mu.Unlock()
+
+				return
 			}
 		}(peer)
 	}
@@ -276,13 +277,18 @@ func (rf *Raft) fireVote() {
 				reply := RequestVoteReply{}
 
 				if peer.Call("RequestVote", &args, &reply) && reply.VoteGranted {
-					accepted <- struct{}{}
-
 					rf.mu.Lock()
 					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
+						rf.revertToFollower(args.Term)
+
+						rf.mu.Unlock()
+
+						rf.haltElection()
+					} else {
+						rf.mu.Unlock()
+
+						accepted <- struct{}{}
 					}
-					rf.mu.Unlock()
 				}
 			}(peer)
 		}
@@ -327,7 +333,7 @@ func (rf *Raft) electionTimeout() {
 			case state := <-rf.signalElectionTimeout:
 				switch state {
 				case resumeElectionTimeout:
-					continue
+					continue // resume only when stopped
 				case stopElectionTimeout:
 					for {
 						if state := <-rf.signalElectionTimeout; state == resumeElectionTimeout {
@@ -370,6 +376,27 @@ func (rf *Raft) haltElection() {
 	}
 }
 
+func (rf *Raft) isHeartbeat(args *AppendEntriesArgs) bool {
+	return len(args.Entries) == 0
+}
+
+func (rf *Raft) revertToFollower(term int) {
+	rf.stopHeartbeat()
+
+	rf.currentTerm = term
+	rf.state = follower
+}
+
+func (rf *Raft) evaluateTermOnRPC(term int) {
+	if term > rf.currentTerm {
+		rf.resumeElectionTimeout()
+
+		rf.revertToFollower(term)
+	} else {
+		rf.resetElectionTimeout()
+	}
+}
+
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 
@@ -405,13 +432,56 @@ func (rf *Raft) RequestVote(
 	reply *RequestVoteReply,
 ) {
 	// Your code here (2A, 2B).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	defer func() {
+		reply.Term = rf.currentTerm
+	}()
+
+	if args.Term >= rf.currentTerm {
+		rf.evaluateTermOnRPC(args.Term)
+
+		if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
+			len(rf.log)-1 == args.LastLogIndex &&
+			rf.log[args.LastLogIndex].Term == args.LastLogTerm {
+
+			reply.VoteGranted = true
+
+			rf.votedFor = args.CandidateId
+		}
+	}
 }
 
 func (rf *Raft) AppendEntries(
 	args *AppendEntriesArgs,
 	reply *AppendEntriesReply,
 ) {
-	rf.resetElectionTimeout()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	defer func() {
+		reply.Term = rf.currentTerm
+	}()
+
+	if args.Term >= rf.currentTerm {
+		rf.evaluateTermOnRPC(args.Term)
+
+		if len(rf.log)-1 == args.PrevLogIndex &&
+			rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
+
+			reply.Success = true
+
+			if rf.isHeartbeat(args) {
+				rf.votedFor = -1
+
+				return
+			}
+
+			// TODO: remaining (steps 3., 4. and 5.)
+		}
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
