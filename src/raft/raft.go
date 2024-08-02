@@ -29,7 +29,7 @@ import (
 // import "../labgob"
 
 const (
-	heartbeatReties = 2
+	heartbeatRetries = 2
 
 	heartbeatTimeout = time.Millisecond * 200
 
@@ -109,6 +109,7 @@ type Raft struct {
 	signalHeartbeat       chan hearbeatState
 	signalElectionTimeout chan electionTimeoutState
 	signalElectionHalt    chan struct{}
+	electing              int32
 
 	// Persistent state
 	currentTerm int
@@ -183,14 +184,15 @@ func (rf *Raft) fireHeartbeat() {
 
 			reply := AppendEntriesReply{}
 
-			for retries := heartbeatReties; retries > 0; retries-- {
+			for retries := heartbeatRetries; retries > 0; retries-- {
 				if peer.Call("AppendEntries", &args, &reply) {
-					rf.mu.Lock()
-					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
+					if reply.Success {
+						rf.mu.Lock()
+						if reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+						}
+						rf.mu.Unlock()
 					}
-					rf.mu.Unlock()
-
 					return
 				}
 			}
@@ -239,6 +241,17 @@ func (rf *Raft) resumeHeartBeat() {
 }
 
 func (rf *Raft) fireVote() {
+	atomic.StoreInt32(&rf.electing, 1)
+
+	defer func() {
+		atomic.StoreInt32(&rf.electing, 0)
+
+		select {
+		case <-rf.signalElectionHalt: // drain channel
+		default:
+		}
+	}()
+
 	for {
 	retry:
 		rf.mu.Lock()
@@ -250,7 +263,27 @@ func (rf *Raft) fireVote() {
 
 		for _, peer := range rf.others {
 			go func(peer *labrpc.ClientEnd) {
-				// TODO: vote request logic
+				rf.mu.Lock()
+				lastLogIndex := len(rf.log) - 1
+				args := RequestVoteArgs{
+					Term:         rf.currentTerm,
+					CandidateId:  rf.me,
+					LastLogIndex: lastLogIndex,
+					LastLogTerm:  rf.log[lastLogIndex].Term,
+				}
+				rf.mu.Unlock()
+
+				reply := RequestVoteReply{}
+
+				if peer.Call("RequestVote", &args, &reply) && reply.VoteGranted {
+					accepted <- struct{}{}
+
+					rf.mu.Lock()
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+					}
+					rf.mu.Unlock()
+				}
 			}(peer)
 		}
 
@@ -327,6 +360,10 @@ func (rf *Raft) resumeElectionTimeout() {
 }
 
 func (rf *Raft) haltElection() {
+	if atomic.LoadInt32(&rf.electing) == 0 {
+		return
+	}
+
 	select {
 	case rf.signalElectionHalt <- struct{}{}:
 	default:
