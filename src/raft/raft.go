@@ -206,15 +206,12 @@ func (rf *Raft) fireHeartbeat() {
 
 func (rf *Raft) hearbeat() {
 	go func() {
-		// timer := time.NewTimer(heartbeatTimeout)
-		// timer := time.NewTimer(timeout)
 		timer := time.After(heartbeatTimeout)
 
 		for {
 			select {
 			case <-rf.signalKill:
 				return
-				// case <-timer.C:
 			case <-timer:
 				rf.fireHeartbeat()
 			case state := <-rf.signalHeartbeat:
@@ -230,11 +227,6 @@ func (rf *Raft) hearbeat() {
 				}
 			}
 
-			// if !timer.Stop() {
-			// 	<-timer.C // drain channel
-			// }
-
-			// timer.Reset(heartbeatTimeout)
 			timer = time.After(heartbeatTimeout)
 		}
 	}()
@@ -347,7 +339,6 @@ func (rf *Raft) fireVote() bool {
 func (rf *Raft) electionTimeout() {
 	go func() {
 		timeout := genElectionTimeout()
-		// timer := time.NewTimer(timeout)
 		timer := time.After(timeout)
 
 		DPrintf("%v started election timeout with %v", rf.me, timeout)
@@ -356,7 +347,6 @@ func (rf *Raft) electionTimeout() {
 			select {
 			case <-rf.signalKill:
 				return
-				// case <-timer.C:
 			case <-timer:
 				if elected := rf.fireVote(); elected {
 					for {
@@ -379,12 +369,7 @@ func (rf *Raft) electionTimeout() {
 				}
 			}
 
-			// if !timer.Stop() {
-			// 	<-timer.C // drain channel
-			// }
-
 			timeout := genElectionTimeout()
-			// timer.Reset(timeout)
 			timer = time.After(timeout)
 
 			DPrintf("%v reseted election timeout with %v", rf.me, timeout)
@@ -552,43 +537,6 @@ func (rf *Raft) AppendEntries(
 	}
 }
 
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-// func (rf *Raft) sendRequestVote(
-// 	server int,
-// 	args *RequestVoteArgs,
-// 	reply *RequestVoteReply,
-// ) bool {
-// 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-// 	return ok
-// }
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -601,14 +549,23 @@ func (rf *Raft) AppendEntries(
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
+func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
 	// Your code here (2B).
 
-	return index, term, isLeader
+	rf.mu.Lock()
+	index = rf.commitIndex
+	term = rf.currentTerm
+	if isLeader = rf.state == leader; !isLeader {
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
+
+	go func() {
+		// fire append entries
+	}()
+
+	return
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
