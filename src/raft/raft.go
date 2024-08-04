@@ -72,7 +72,7 @@ type hearbeatState int
 
 const (
 	stopHeartbeat hearbeatState = iota
-	resumeHeartBeat
+	resumeHeartbeat
 )
 
 type electionTimeoutState int
@@ -164,6 +164,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg       // receives applied messages
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -176,7 +177,6 @@ type Raft struct {
 	signalElectionTimeout chan electionTimeoutState
 	signalElectionHalt    chan struct{}
 	electing              int32
-	applyCh               chan ApplyMsg
 
 	// Persistent state
 	currentTerm int
@@ -293,11 +293,11 @@ func (rf *Raft) hearbeat() {
 				switch state {
 				case stopHeartbeat:
 					for {
-						if state := <-rf.signalHeartbeat; state == resumeHeartBeat {
+						if state := <-rf.signalHeartbeat; state == resumeHeartbeat {
 							break
 						}
 					}
-				case resumeHeartBeat:
+				case resumeHeartbeat:
 					continue
 				}
 			}
@@ -308,15 +308,11 @@ func (rf *Raft) hearbeat() {
 }
 
 func (rf *Raft) stopHeartbeat() {
-	go func() {
-		rf.signalHeartbeat <- stopHeartbeat
-	}()
+	rf.signalHeartbeat <- stopHeartbeat
 }
 
 func (rf *Raft) resumeHeartBeat() {
-	go func() {
-		rf.signalHeartbeat <- resumeHeartBeat
-	}()
+	rf.signalHeartbeat <- resumeHeartbeat
 }
 
 func (rf *Raft) fireVote() bool {
@@ -457,21 +453,15 @@ func (rf *Raft) electionTimeout() {
 }
 
 func (rf *Raft) stopElectionTimeout() {
-	go func() {
-		rf.signalElectionTimeout <- stopElectionTimeout
-	}()
+	rf.signalElectionTimeout <- stopElectionTimeout
 }
 
 func (rf *Raft) resetElectionTimeout() {
-	go func() {
-		rf.signalElectionTimeout <- resetElectionTimeout
-	}()
+	rf.signalElectionTimeout <- resetElectionTimeout
 }
 
 func (rf *Raft) resumeElectionTimeout() {
-	go func() {
-		rf.signalElectionTimeout <- resumeElectionTimeout
-	}()
+	rf.signalElectionTimeout <- resumeElectionTimeout
 }
 
 func (rf *Raft) haltElection() {
@@ -479,9 +469,7 @@ func (rf *Raft) haltElection() {
 		return
 	}
 
-	go func() {
-		rf.signalElectionHalt <- struct{}{}
-	}()
+	rf.signalElectionHalt <- struct{}{}
 }
 
 func (rf *Raft) revertToFollower(term int) {
@@ -690,16 +678,16 @@ func Make(
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 
 	rf.majority = calcMajority(len(peers))
 	rf.state = follower
 	rf.signalKill = make(chan struct{})
-	rf.signalHeartbeat = make(chan hearbeatState)
-	rf.signalElectionTimeout = make(chan electionTimeoutState)
-	rf.signalElectionHalt = make(chan struct{})
-	rf.applyCh = applyCh
+	rf.signalHeartbeat = make(chan hearbeatState, len(peers))
+	rf.signalElectionTimeout = make(chan electionTimeoutState, len(peers))
+	rf.signalElectionHalt = make(chan struct{}, len(peers))
 
 	rf.log = []Entry{{}}
 	rf.votedFor = -1
