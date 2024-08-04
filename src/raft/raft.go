@@ -350,17 +350,17 @@ func (rf *Raft) fireVote() bool {
 
 		DPrintf("%v - %v set election timeout voting to %v", rf.state, rf.me, timeout)
 
-		for pi, peer := range rf.peers {
+		for pi := 0; pi < len(rf.peers); pi++ {
 			if pi == rf.me {
 				continue
 			}
 
-			go func(peer *labrpc.ClientEnd, pi int) {
+			go func(pi int) {
 				DPrintf("%v - %v sent to %v RequestVote RPC: %v", rf.state, rf.me, pi, &args)
 
 				reply := RequestVoteReply{}
 
-				if !peer.Call("Raft.RequestVote", &args, &reply) {
+				if !rf.peers[pi].Call("Raft.RequestVote", &args, &reply) {
 					return
 				}
 
@@ -384,7 +384,7 @@ func (rf *Raft) fireVote() bool {
 
 					rf.revertToFollower(args.Term)
 				}
-			}(peer, pi)
+			}(pi)
 		}
 
 		for {
