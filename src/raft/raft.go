@@ -321,7 +321,7 @@ func (rf *Raft) resumeHeartBeat() {
 
 func (rf *Raft) fireVote() bool {
 	atomic.StoreInt32(&rf.electing, 1)
-	var electionHalted int32
+	electionHalted := false
 
 	func() {
 		atomic.StoreInt32(&rf.electing, 0)
@@ -377,8 +377,9 @@ func (rf *Raft) fireVote() bool {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if reply.Term > rf.currentTerm {
-					if atomic.CompareAndSwapInt32(&electionHalted, 0, 1) {
+					if !electionHalted {
 						rf.haltElection()
+						electionHalted = true
 					}
 
 					rf.revertToFollower(args.Term)
