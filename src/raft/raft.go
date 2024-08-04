@@ -321,14 +321,10 @@ func (rf *Raft) resumeHeartBeat() {
 
 func (rf *Raft) fireVote() bool {
 	atomic.StoreInt32(&rf.electing, 1)
+	var electionHalted int32
 
 	func() {
 		atomic.StoreInt32(&rf.electing, 0)
-
-		select {
-		case <-rf.signalElectionHalt: // drain channel
-		default:
-		}
 	}()
 
 	DPrintf("%v - %v started an election", rf.state, rf.me)
@@ -381,7 +377,9 @@ func (rf *Raft) fireVote() bool {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if reply.Term > rf.currentTerm {
-					rf.haltElection()
+					if atomic.CompareAndSwapInt32(&electionHalted, 0, 1) {
+						rf.haltElection()
+					}
 
 					rf.revertToFollower(args.Term)
 				}
