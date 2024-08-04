@@ -30,12 +30,12 @@ import (
 // import "../labgob"
 
 const (
-	heartbeatTimeout = time.Millisecond * 100
+	heartbeatTimeout = time.Millisecond * 200
 
-	electionTimeoutMin = time.Millisecond * 550
-	electionTimeoutMax = time.Millisecond * 700
+	electionTimeoutMin = time.Millisecond * 450
+	electionTimeoutMax = time.Millisecond * 600
 
-	batchSz = 64
+	batchSz = 128
 )
 
 func genElectionTimeout() time.Duration {
@@ -88,11 +88,6 @@ type Entry struct {
 	Command interface{}
 }
 
-type pendingEntry struct {
-	appendEntries *AppendEntriesArgs
-	sent          chan bool // ignored if heartbeat
-}
-
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -127,7 +122,6 @@ type Raft struct {
 	signalElectionTimeout chan electionTimeoutState
 	signalElectionHalt    chan struct{}
 	electing              int32
-	batchEntries          []chan pendingEntry
 	applyCh               chan ApplyMsg
 
 	// Persistent state
@@ -199,14 +193,26 @@ func (rf *Raft) fireHeartbeat() {
 			continue
 		}
 
-		go func(pending chan<- pendingEntry) {
-			pe := pendingEntry{appendEntries: appendEntries}
+		go func(pi int) {
+			args := appendEntries
+			reply := AppendEntriesReply{}
 
-			select {
-			case <-rf.signalKill:
-			case pending <- pe:
+			DPrintf("%v - %v sent to %v AppendEntries RPC: %v", rf.state, rf.me, pi, args)
+
+			if !rf.peers[pi].Call("Raft.AppendEntries", args, &reply) {
+				return
 			}
-		}(rf.batchEntries[pi])
+
+			DPrintf("%v - %v received from %v AppendEntries RPC reply: %v", rf.state, rf.me, pi, &reply)
+
+			if !reply.Success {
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					rf.revertToFollower(args.Term)
+				}
+				rf.mu.Unlock()
+			}
+		}(pi)
 	}
 }
 
@@ -427,63 +433,6 @@ func (rf *Raft) evaluateTermOnRPC(term int) {
 	}
 }
 
-func (rf *Raft) entrySenders() {
-	for pi, peer := range rf.peers {
-		if pi == rf.me {
-			continue
-		}
-
-		go func(peer *labrpc.ClientEnd, pi int) {
-			pending := rf.batchEntries[pi]
-
-			for {
-			start:
-				select {
-				case <-rf.signalKill:
-					return
-				case pe := <-pending:
-					rf.mu.Lock()
-					if rf.state != leader {
-						rf.mu.Unlock()
-						goto start
-					}
-					rf.mu.Unlock()
-
-					args := pe.appendEntries
-					var reply AppendEntriesReply
-
-					sendAppendEntries := func() bool {
-						reply = AppendEntriesReply{} // by pass RPC warning on reusing the same value.
-						return peer.Call("Raft.AppendEntries", args, &reply)
-					}
-
-					DPrintf("%v - %v sent to %v AppendEntries RPC: %v", rf.state, rf.me, pi, args)
-
-					for !sendAppendEntries() {
-						rf.mu.Lock()
-						if rf.state != leader {
-							rf.mu.Unlock()
-							goto start
-						}
-						rf.mu.Unlock()
-					}
-
-					DPrintf("%v - %v received from %v AppendEntries RPC reply: %v", rf.state, rf.me, pi, &reply)
-
-					// TODO: change this
-					if !reply.Success {
-						rf.mu.Lock()
-						if reply.Term > rf.currentTerm {
-							rf.revertToFollower(args.Term)
-						}
-						rf.mu.Unlock()
-					}
-				}
-			}
-		}(peer, pi)
-	}
-}
-
 func (rf *Raft) newAppendEntries(entries []Entry) *AppendEntriesArgs {
 	prevLogIndex := len(rf.log) - 1
 
@@ -632,31 +581,25 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	}
 	entry := Entry{Term: term, Command: command}
 	appendEntries := rf.newAppendEntries([]Entry{})
+	sent := make(chan bool, len(rf.peers))
 	rf.log = append(rf.log, entry)
 	rf.mu.Unlock()
 
 	go func() {
-		pe := pendingEntry{
-			appendEntries: appendEntries,
-			sent:          make(chan bool, len(rf.peers)),
-		}
-
 		for pi := 0; pi < len(rf.peers); pi++ {
 			if pi == rf.me {
 				continue
 			}
 
-			go func(pending chan<- pendingEntry) {
-				select {
-				case <-rf.signalKill:
-				case pending <- pe:
-				}
-			}(rf.batchEntries[pi])
+			go func(pi int) {
+				// TODO: send
+				_ = appendEntries
+			}(pi)
 		}
 
 		withMajority := false
 		for i, confirmed := len(rf.peers)-1, 0; i >= 0; i-- {
-			if <-pe.sent {
+			if <-sent {
 				if confirmed++; confirmed < rf.majority {
 					withMajority = true
 
@@ -742,10 +685,6 @@ func Make(
 	rf.signalHeartbeat = make(chan hearbeatState, len(peers))
 	rf.signalElectionTimeout = make(chan electionTimeoutState, len(peers))
 	rf.signalElectionHalt = make(chan struct{}, len(peers))
-	rf.batchEntries = make([]chan pendingEntry, len(peers))
-	for pi := 0; pi < len(peers); pi++ {
-		rf.batchEntries[pi] = make(chan pendingEntry, batchSz)
-	}
 	rf.applyCh = applyCh
 
 	rf.log = []Entry{{}}
@@ -759,7 +698,6 @@ func Make(
 	rf.hearbeat()
 	rf.stopHeartbeat()
 	rf.electionTimeout()
-	rf.entrySenders()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
