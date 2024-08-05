@@ -1,22 +1,5 @@
 package raft
 
-//
-// this is an outline of the API that raft must expose to
-// the service (or tester). see comments below for
-// each of these functions for more details.
-//
-// rf = Make(...)
-//   create a new Raft server.
-// rf.Start(command interface{}) (index, term, isleader)
-//   start agreement on a new log entry
-// rf.GetState() (term, isLeader)
-//   ask a Raft for its current term, and whether it thinks it is leader
-// ApplyMsg
-//   each time a new entry is committed to the log, each Raft peer
-//   should send an ApplyMsg to the service (or tester)
-//   in the same server.
-//
-
 import (
 	"../labrpc"
 	"fmt"
@@ -81,6 +64,14 @@ const (
 	stopElectionTimeout electionTimeoutState = iota
 	resetElectionTimeout
 	resumeElectionTimeout
+)
+
+type appendState int
+
+const (
+	appendSent appendState = iota
+	appendNotSent
+	backToFollower
 )
 
 type Entry struct {
@@ -177,6 +168,7 @@ type Raft struct {
 	signalElectionTimeout chan electionTimeoutState
 	signalElectionHalt    chan struct{}
 	electing              int32
+	batches               chan *AppendEntriesArgs
 
 	// Persistent state
 	currentTerm int
@@ -266,15 +258,15 @@ func (rf *Raft) fireHeartbeat() {
 
 			DPrintf("%v - %v received from %v AppendEntries RPC reply: %v", rf.state, rf.me, pi, &reply)
 
-			if reply.Success {
-				return
-			}
-
 			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if reply.Success {
+				rf.nextIndex[pi] = len(rf.log)
+				rf.matchIndex[pi] = args.PrevLogIndex // + len(args.Entries) == 0
+			}
 			if reply.Term > rf.currentTerm {
 				rf.revertToFollower(args.Term)
 			}
-			rf.mu.Unlock()
 		}(pi)
 	}
 }
@@ -394,6 +386,9 @@ func (rf *Raft) fireVote() bool {
 
 				rf.mu.Lock()
 				rf.state = leader
+				for pi := 0; pi < len(rf.peers); pi++ {
+					rf.nextIndex[pi] = len(rf.log)
+				}
 				rf.mu.Unlock()
 
 				rf.fireHeartbeat()
@@ -492,6 +487,119 @@ func (rf *Raft) evaluateTermOnRPC(term int) {
 	}
 }
 
+func (rf *Raft) applyCommand() {
+	for rf.commitIndex > rf.lastApplied {
+		rf.lastApplied++
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[rf.lastApplied].Command,
+			CommandIndex: rf.lastApplied,
+		}
+	}
+}
+
+func (rf *Raft) appendEntries() {
+	go func() {
+		for {
+			select {
+			case <-rf.signalKill:
+			case rargs := <-rf.batches:
+				sent := make(chan appendState, len(rf.peers))
+
+				for pi := 0; pi < len(rf.peers); pi++ {
+					if pi == rf.me {
+						continue
+					}
+
+					go func(pi int) {
+						args := *rargs
+
+						for {
+							reply := AppendEntriesReply{}
+
+							rf.mu.Lock()
+							send := len(rf.log)-1 >= rf.nextIndex[pi]
+							rf.mu.Unlock()
+
+							if !send || !rf.peers[pi].Call("Raft.AppendEntries", &args, &reply) {
+								sent <- appendNotSent
+
+								return
+							}
+
+							rf.mu.Lock()
+							if reply.Success {
+								rf.nextIndex[pi] = len(rf.log)
+								rf.matchIndex[pi] = args.PrevLogIndex + len(args.Entries)
+								rf.mu.Unlock()
+
+								sent <- appendSent
+
+								return
+							}
+							if reply.Term > rf.currentTerm {
+								rf.revertToFollower(args.Term)
+								rf.mu.Unlock()
+
+								sent <- backToFollower
+
+								return
+							}
+							args.PrevLogIndex--
+							rf.nextIndex[pi]--
+							args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+							args.Entries = rf.log[args.PrevLogIndex+1:]
+							rf.mu.Unlock()
+						}
+					}(pi)
+				}
+
+				withMajority := false
+				confirmed := 0
+			confirmations:
+				for i := len(rf.peers) - 1; i > 0; i-- {
+					switch <-sent {
+					case appendSent:
+						if confirmed++; confirmed == rf.majority {
+							withMajority = true
+
+							break confirmations
+						}
+					case appendNotSent:
+					case backToFollower:
+						rf.resetElectionTimeout()
+						return
+					}
+				}
+
+				if !withMajority {
+					return
+				}
+
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				N := len(rf.log) - 1
+				for ; N > 0; N-- {
+					if rf.log[N].Term == rf.currentTerm && N > rf.commitIndex {
+						greater := 0
+						for _, mi := range rf.matchIndex {
+							if mi >= N {
+								if greater++; greater == rf.majority {
+									rf.commitIndex = N
+
+									rf.applyCommand()
+
+									return
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}()
+}
+
 func (rf *Raft) RequestVote(
 	args *RequestVoteArgs,
 	reply *RequestVoteReply,
@@ -536,17 +644,33 @@ func (rf *Raft) AppendEntries(
 		reply.Term = rf.currentTerm
 	}()
 
-	if args.Term >= rf.currentTerm {
-		rf.evaluateTermOnRPC(args.Term)
+	if args.Term < rf.currentTerm {
+		return
+	}
 
-		if len(rf.log) > args.PrevLogIndex &&
-			rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
+	rf.evaluateTermOnRPC(args.Term)
 
-			reply.Success = true
+	if args.PrevLogIndex >= len(rf.log) ||
+		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 
-			// TODO: remaining (steps 3., 4. and 5.)
+		return
+	}
+
+	rf.log = rf.log[:args.PrevLogIndex+1]
+
+	rf.log = append(rf.log, args.Entries...)
+
+	if args.LeaderCommit > rf.commitIndex {
+		if lastNewEntryIndex := len(rf.log) - 1; args.LeaderCommit < lastNewEntryIndex {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = lastNewEntryIndex
 		}
 	}
+
+	rf.appendEntries()
+
+	reply.Success = true
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -571,9 +695,9 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 		rf.mu.Unlock()
 		return
 	}
-	entry := Entry{Term: term, Command: command}
 	prevLogIndex := len(rf.log) - 1
-	args := AppendEntriesArgs{
+	entry := Entry{Term: term, Command: command}
+	rargs := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: prevLogIndex,
@@ -581,59 +705,10 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 		Entries:      []Entry{entry},
 		LeaderCommit: rf.commitIndex,
 	}
-	sent := make(chan bool, len(rf.peers))
 	rf.log = append(rf.log, entry)
 	rf.mu.Unlock()
 
-	go func() {
-		for pi := 0; pi < len(rf.peers); pi++ {
-			if pi == rf.me {
-				continue
-			}
-
-			go func(pi int) {
-				// TODO: send
-				_ = args
-				reply := AppendEntriesReply{}
-				_ = reply
-			}(pi)
-		}
-
-		withMajority := false
-		for i, confirmed := len(rf.peers)-1, 0; i >= 0; i-- {
-			if <-sent {
-				if confirmed++; confirmed < rf.majority {
-					withMajority = true
-
-					break
-				}
-			}
-		}
-
-		if !withMajority {
-			// TODO: failed, do nothing?
-
-			return
-		}
-
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		N := len(rf.log) - 1
-		for ; N > 0; N-- {
-			if rf.log[N].Term == rf.currentTerm && N > rf.commitIndex {
-				greater := 0
-				for _, mi := range rf.matchIndex {
-					if mi >= N {
-						if greater++; greater == rf.majority {
-							rf.commitIndex = N
-
-							return
-						}
-					}
-				}
-			}
-		}
-	}()
+	rf.batches <- rargs
 
 	return
 }
@@ -688,6 +763,7 @@ func Make(
 	rf.signalHeartbeat = make(chan hearbeatState, len(peers))
 	rf.signalElectionTimeout = make(chan electionTimeoutState, len(peers))
 	rf.signalElectionHalt = make(chan struct{}, len(peers))
+	rf.batches = make(chan *AppendEntriesArgs, batchSz)
 
 	rf.log = []Entry{{}}
 	rf.votedFor = -1
@@ -700,6 +776,7 @@ func Make(
 	rf.hearbeat()
 	rf.stopHeartbeat()
 	rf.electionTimeout()
+	rf.appendEntries()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
