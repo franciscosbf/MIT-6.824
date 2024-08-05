@@ -365,12 +365,12 @@ func (rf *Raft) fireVote() bool {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if reply.Term > rf.currentTerm {
+					rf.revertToFollower(args.Term)
+
 					if !electionHalted {
 						rf.haltElection()
 						electionHalted = true
 					}
-
-					rf.revertToFollower(args.Term)
 				}
 			}(pi)
 		}
@@ -504,7 +504,7 @@ func (rf *Raft) appendEntries() {
 			select {
 			case <-rf.signalKill:
 			case rargs := <-rf.batches:
-				sent := make(chan appendState, len(rf.peers))
+				sendAck := make(chan appendState, len(rf.peers))
 
 				for pi := 0; pi < len(rf.peers); pi++ {
 					if pi == rf.me {
@@ -522,7 +522,7 @@ func (rf *Raft) appendEntries() {
 							rf.mu.Unlock()
 
 							if !send || !rf.peers[pi].Call("Raft.AppendEntries", &args, &reply) {
-								sent <- appendNotSent
+								sendAck <- appendNotSent
 
 								return
 							}
@@ -533,7 +533,7 @@ func (rf *Raft) appendEntries() {
 								rf.matchIndex[pi] = args.PrevLogIndex + len(args.Entries)
 								rf.mu.Unlock()
 
-								sent <- appendSent
+								sendAck <- appendSent
 
 								return
 							}
@@ -541,7 +541,7 @@ func (rf *Raft) appendEntries() {
 								rf.revertToFollower(args.Term)
 								rf.mu.Unlock()
 
-								sent <- backToFollower
+								sendAck <- backToFollower
 
 								return
 							}
@@ -558,7 +558,7 @@ func (rf *Raft) appendEntries() {
 				confirmed := 0
 			confirmations:
 				for i := len(rf.peers) - 1; i > 0; i-- {
-					switch <-sent {
+					switch <-sendAck {
 					case appendSent:
 						if confirmed++; confirmed == rf.majority {
 							withMajority = true
