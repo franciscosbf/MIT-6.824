@@ -487,9 +487,10 @@ func (rf *Raft) evaluateTermOnRPC(term int) {
 	}
 }
 
-func (rf *Raft) applyCommand() {
+func (rf *Raft) applyCommands() {
 	for rf.commitIndex > rf.lastApplied {
 		rf.lastApplied++
+		DPrintf("%v - %v applied index %v", rf.state, rf.me, rf.lastApplied)
 		rf.applyCh <- ApplyMsg{
 			CommandValid: true,
 			Command:      rf.log[rf.lastApplied].Command,
@@ -503,6 +504,7 @@ func (rf *Raft) appendEntries() {
 		for {
 			select {
 			case <-rf.signalKill:
+				return
 			case rargs := <-rf.batches:
 				sendAck := make(chan appendState, len(rf.peers))
 
@@ -521,11 +523,21 @@ func (rf *Raft) appendEntries() {
 							send := len(rf.log)-1 >= rf.nextIndex[pi]
 							rf.mu.Unlock()
 
-							if !send || !rf.peers[pi].Call("Raft.AppendEntries", &args, &reply) {
+							if !send {
 								sendAck <- appendNotSent
 
 								return
 							}
+
+							DPrintf("%v - %v sent to %v RequestVote RPC: %v", rf.state, rf.me, pi, &args)
+
+							if !rf.peers[pi].Call("Raft.AppendEntries", &args, &reply) {
+								sendAck <- appendNotSent
+
+								return
+							}
+
+							DPrintf("%v - %v received from %v AppendEntries RPC reply: %v", rf.state, rf.me, pi, &reply)
 
 							rf.mu.Lock()
 							if reply.Success {
@@ -577,8 +589,8 @@ func (rf *Raft) appendEntries() {
 				}
 
 				rf.mu.Lock()
-				defer rf.mu.Unlock()
 				N := len(rf.log) - 1
+			commitIdxCheck:
 				for ; N > 0; N-- {
 					if rf.log[N].Term == rf.currentTerm && N > rf.commitIndex {
 						greater := 0
@@ -587,14 +599,15 @@ func (rf *Raft) appendEntries() {
 								if greater++; greater == rf.majority {
 									rf.commitIndex = N
 
-									rf.applyCommand()
+									rf.applyCommands()
 
-									return
+									break commitIdxCheck
 								}
 							}
 						}
 					}
 				}
+				rf.mu.Unlock()
 			}
 		}
 	}()
@@ -668,7 +681,7 @@ func (rf *Raft) AppendEntries(
 		}
 	}
 
-	rf.appendEntries()
+	rf.applyCommands()
 
 	reply.Success = true
 }
@@ -689,7 +702,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	// Your code here (2B).
 
 	rf.mu.Lock()
-	index = rf.commitIndex
+	index = len(rf.log)
 	term = rf.currentTerm
 	if isLeader = rf.state == leader; !isLeader {
 		rf.mu.Unlock()
