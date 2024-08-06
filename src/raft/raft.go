@@ -58,14 +58,6 @@ const (
 	resumeHeartbeat
 )
 
-type electionTimeoutState int
-
-const (
-	stopElectionTimeout electionTimeoutState = iota
-	resetElectionTimeout
-	resumeElectionTimeout
-)
-
 type appendState int
 
 const (
@@ -165,7 +157,7 @@ type Raft struct {
 	state                 peerState
 	signalKill            chan struct{}
 	signalHeartbeat       chan hearbeatState
-	signalElectionTimeout chan electionTimeoutState
+	signalElectionTimeout chan struct{}
 	signalElectionHalt    chan struct{}
 	electing              int32
 	batches               chan *AppendEntriesArgs
@@ -284,11 +276,15 @@ func (rf *Raft) hearbeat() {
 			case state := <-rf.signalHeartbeat:
 				switch state {
 				case stopHeartbeat:
+					DPrintf("%v - %v stopped heartbeat", rf.state, rf.me)
+
 					for {
 						if state := <-rf.signalHeartbeat; state == resumeHeartbeat {
 							break
 						}
 					}
+
+					DPrintf("%v - %v proceeds to resume heartbeat", rf.state, rf.me)
 				case resumeHeartbeat:
 					continue
 				}
@@ -419,24 +415,16 @@ func (rf *Raft) electionTimeout() {
 				rf.stopHeartbeat()
 
 				if elected := rf.fireVote(); elected {
-					for {
-						if state := <-rf.signalElectionTimeout; state == resumeElectionTimeout {
-							break
-						}
+					select {
+					case <-rf.signalKill:
+						return
+					case <-rf.signalElectionTimeout:
+						DPrintf("%v - %v resumed election timeout", rf.state, rf.me)
 					}
 				}
-			case state := <-rf.signalElectionTimeout:
-				switch state {
-				case resumeElectionTimeout:
-					continue
-				case stopElectionTimeout:
-					for {
-						if state := <-rf.signalElectionTimeout; state == resumeElectionTimeout {
-							break
-						}
-					}
-				case resetElectionTimeout:
-				}
+
+				DPrintf("%v - %v proceeds to restart election", rf.state, rf.me)
+			case <-rf.signalElectionTimeout:
 			}
 
 			timeout := genElectionTimeout()
@@ -447,16 +435,8 @@ func (rf *Raft) electionTimeout() {
 	}()
 }
 
-func (rf *Raft) stopElectionTimeout() {
-	rf.signalElectionTimeout <- stopElectionTimeout
-}
-
 func (rf *Raft) resetElectionTimeout() {
-	rf.signalElectionTimeout <- resetElectionTimeout
-}
-
-func (rf *Raft) resumeElectionTimeout() {
-	rf.signalElectionTimeout <- resumeElectionTimeout
+	rf.signalElectionTimeout <- struct{}{}
 }
 
 func (rf *Raft) haltElection() {
@@ -479,10 +459,7 @@ func (rf *Raft) revertToFollower(term int) {
 
 func (rf *Raft) evaluateTermOnRPC(term int) {
 	if term > rf.currentTerm {
-		rf.resumeElectionTimeout()
-
 		rf.revertToFollower(term)
-	} else {
 		rf.resetElectionTimeout()
 	}
 }
@@ -499,7 +476,7 @@ func (rf *Raft) applyCommands() {
 	}
 }
 
-func (rf *Raft) appendEntries() {
+func (rf *Raft) forwardAppendEntries() {
 	go func() {
 		for {
 			select {
@@ -774,7 +751,7 @@ func Make(
 	rf.state = follower
 	rf.signalKill = make(chan struct{})
 	rf.signalHeartbeat = make(chan hearbeatState, len(peers))
-	rf.signalElectionTimeout = make(chan electionTimeoutState, len(peers))
+	rf.signalElectionTimeout = make(chan struct{}, len(peers))
 	rf.signalElectionHalt = make(chan struct{}, len(peers))
 	rf.batches = make(chan *AppendEntriesArgs, batchSz)
 
@@ -789,7 +766,7 @@ func Make(
 	rf.hearbeat()
 	rf.stopHeartbeat()
 	rf.electionTimeout()
-	rf.appendEntries()
+	rf.forwardAppendEntries()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
