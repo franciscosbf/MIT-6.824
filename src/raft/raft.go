@@ -249,6 +249,9 @@ func (rf *Raft) fireHeartbeat() {
 			for {
 				reply := AppendEntriesReply{}
 
+				DPrintf("%v with rf.commitIndex: %v, rf.lastApplied: %v, rf.log: %v",
+					rf.me, rf.commitIndex, rf.lastApplied, rf.log)
+
 				DPrintf("%v - %v sent to %v AppendEntries RPC as part of heartbeat: %v",
 					rf.state, rf.me, pi, &args)
 
@@ -601,7 +604,7 @@ func (rf *Raft) forwardAppendEntries() {
 				}
 
 				if !withMajority {
-					return
+					continue
 				}
 
 				rf.mu.Lock()
@@ -679,6 +682,9 @@ func (rf *Raft) AppendEntries(
 
 	rf.evaluateTermOnRPC(args.Term)
 
+	DPrintf("%v with rf.commitIndex: %v, rf.lastApplied: %v, rf.log: %v",
+		rf.me, rf.commitIndex, rf.lastApplied, rf.log)
+
 	if args.PrevLogIndex >= len(rf.log) ||
 		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 
@@ -696,9 +702,6 @@ func (rf *Raft) AppendEntries(
 			rf.commitIndex = lastNewEntryIndex
 		}
 	}
-
-	DPrintf("%v with rf.commitIndex: %v, rf.lastApplied: %v, rf.log: %v",
-		rf.me, rf.commitIndex, rf.lastApplied, rf.log)
 
 	rf.applyCommands()
 
