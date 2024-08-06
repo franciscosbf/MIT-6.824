@@ -19,6 +19,8 @@ const (
 	electionTimeoutMax = time.Millisecond * 600
 
 	batchSz = 128
+
+	applyCommandsTimeout = time.Second
 )
 
 func genElectionTimeout() time.Duration {
@@ -245,8 +247,8 @@ func (rf *Raft) fireHeartbeat() {
 			for {
 				reply := AppendEntriesReply{}
 
-				DPrintf("%v with rf.commitIndex: %v, rf.lastApplied: %v, rf.log: %v",
-					rf.me, rf.commitIndex, rf.lastApplied, rf.log)
+				// DPrintf("%v with rf.commitIndex: %v, rf.lastApplied: %v, rf.log: %v",
+				// 	rf.me, rf.commitIndex, rf.lastApplied, rf.log)
 
 				DPrintf("%v - %v sent to %v AppendEntries RPC as part of heartbeat: %v",
 					rf.state, rf.me, pi, &args)
@@ -284,32 +286,41 @@ func (rf *Raft) fireHeartbeat() {
 
 func (rf *Raft) hearbeat() {
 	go func() {
-		timer := time.After(heartbeatTimeout)
+		var state hearbeatState
+
+	stopped:
+		for {
+			select {
+			case <-rf.signalKill:
+				return
+			case state = <-rf.signalHeartbeat:
+			}
+
+			if state == resumeHeartbeat {
+				break
+			}
+		}
+
+		DPrintf("%v - %v proceeds to resume heartbeat", rf.state, rf.me)
 
 		for {
+			timer := time.After(heartbeatTimeout)
+
 			select {
 			case <-rf.signalKill:
 				return
 			case <-timer:
 				rf.fireHeartbeat()
-			case state := <-rf.signalHeartbeat:
-				switch state {
-				case stopHeartbeat:
-					DPrintf("%v - %v stopped heartbeat", rf.state, rf.me)
-
-					for {
-						if state := <-rf.signalHeartbeat; state == resumeHeartbeat {
-							break
-						}
-					}
-
-					DPrintf("%v - %v proceeds to resume heartbeat", rf.state, rf.me)
-				case resumeHeartbeat:
-					continue
-				}
+			case state = <-rf.signalHeartbeat:
 			}
 
-			timer = time.After(heartbeatTimeout)
+			switch state {
+			case stopHeartbeat:
+				DPrintf("%v - %v stopped heartbeat", rf.state, rf.me)
+
+				goto stopped
+			case resumeHeartbeat:
+			}
 		}
 	}()
 }
@@ -497,19 +508,51 @@ func (rf *Raft) evaluateTermOnRPC(term int) {
 }
 
 func (rf *Raft) applyCommands() {
-	for rf.commitIndex > rf.lastApplied {
-		rf.lastApplied++
-		DPrintf("%v - %v applied entry %v at index %v",
-			rf.state, rf.me, rf.log[rf.lastApplied], rf.lastApplied)
-		rf.applyCh <- ApplyMsg{
-			CommandValid: true,
-			Command:      rf.log[rf.lastApplied].Command,
-			CommandIndex: rf.lastApplied,
+	go func() {
+		for {
+			select {
+			case <-rf.signalKill:
+				return
+			default:
+			}
+
+			time.Sleep(applyCommandsTimeout)
+
+			rf.mu.Lock()
+			if rf.state == leader {
+				N := len(rf.log) - 1
+			commitIdxCheck:
+				for ; N > 0; N-- {
+					if rf.log[N].Term == rf.currentTerm && N > rf.commitIndex {
+						greater := 0
+						for _, mi := range rf.matchIndex {
+							if mi >= N {
+								if greater++; greater == rf.majority {
+									rf.commitIndex = N
+
+									break commitIdxCheck
+								}
+							}
+						}
+					}
+				}
+			}
+			for rf.commitIndex > rf.lastApplied {
+				rf.lastApplied++
+				DPrintf("%v - %v applied entry %v at index %v",
+					rf.state, rf.me, rf.log[rf.lastApplied], rf.lastApplied)
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[rf.lastApplied].Command,
+					CommandIndex: rf.lastApplied,
+				}
+			}
+			rf.mu.Unlock()
 		}
-	}
+	}()
 }
 
-func (rf *Raft) forwardAppendEntries() {
+func (rf *Raft) batchAppendEntries() {
 	go func() {
 		for {
 			select {
@@ -525,7 +568,6 @@ func (rf *Raft) forwardAppendEntries() {
 
 					go func(pi int) {
 						args := *rargs
-
 						for {
 							reply := AppendEntriesReply{}
 
@@ -611,8 +653,6 @@ func (rf *Raft) forwardAppendEntries() {
 								if greater++; greater == rf.majority {
 									rf.commitIndex = N
 
-									rf.applyCommands()
-
 									break commitIdxCheck
 								}
 							}
@@ -675,8 +715,8 @@ func (rf *Raft) AppendEntries(
 
 	rf.evaluateTermOnRPC(args.Term)
 
-	DPrintf("%v with rf.commitIndex: %v, rf.lastApplied: %v, rf.log: %v",
-		rf.me, rf.commitIndex, rf.lastApplied, rf.log)
+	// DPrintf("%v with rf.commitIndex: %v, rf.lastApplied: %v, rf.log: %v",
+	// 	rf.me, rf.commitIndex, rf.lastApplied, rf.log)
 
 	if args.PrevLogIndex >= len(rf.log) ||
 		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -695,8 +735,6 @@ func (rf *Raft) AppendEntries(
 			rf.commitIndex = lastNewEntryIndex
 		}
 	}
-
-	rf.applyCommands()
 
 	reply.Success = true
 }
@@ -802,9 +840,9 @@ func Make(
 	rf.matchIndex = make([]int, len(peers))
 
 	rf.hearbeat()
-	rf.stopHeartbeat()
 	rf.electionTimeout()
-	rf.forwardAppendEntries()
+	rf.batchAppendEntries()
+	rf.applyCommands()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
