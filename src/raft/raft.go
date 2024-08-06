@@ -161,7 +161,7 @@ type Raft struct {
 	signalElectionHalt    chan struct{}
 	electing              int32
 	batches               chan *AppendEntriesArgs
-	batchLocks            []sync.Mutex
+	batchMu               []*sync.Mutex
 
 	// Persistent state
 	currentTerm int
@@ -242,20 +242,22 @@ func (rf *Raft) fireHeartbeat() {
 		}
 
 		go func(pi int) {
-			// rf.batchLocks[pi].Lock()
-			// defer rf.batchLocks[pi].Unlock()
+			// rf.batchMu[pi].Lock()
+			// defer rf.batchMu[pi].Unlock()
 
 			args := *rargs
 			for {
 				reply := AppendEntriesReply{}
 
-				DPrintf("%v - %v sent to %v AppendEntries RPC: %v", rf.state, rf.me, pi, &args)
+				DPrintf("%v - %v sent to %v AppendEntries RPC as part of heartbeat: %v",
+					rf.state, rf.me, pi, &args)
 
 				if !rf.peers[pi].Call("Raft.AppendEntries", &args, &reply) {
 					return
 				}
 
-				DPrintf("%v - %v received from %v AppendEntries RPC reply: %v", rf.state, rf.me, pi, &reply)
+				DPrintf("%v - %v received from %v AppendEntries RPC reply as part of heartbeat: %v",
+					rf.state, rf.me, pi, &reply)
 
 				rf.mu.Lock()
 				if reply.Success {
@@ -277,24 +279,6 @@ func (rf *Raft) fireHeartbeat() {
 				args.Entries = rf.log[args.PrevLogIndex+1:]
 				rf.mu.Unlock()
 			}
-
-			// DPrintf("%v - %v sent to %v AppendEntries RPC: %v", rf.state, rf.me, pi, &args)
-			//
-			// if !rf.peers[pi].Call("Raft.AppendEntries", &args, &reply) {
-			// 	return
-			// }
-			//
-			// DPrintf("%v - %v received from %v AppendEntries RPC reply: %v", rf.state, rf.me, pi, &reply)
-			//
-			// rf.mu.Lock()
-			// defer rf.mu.Unlock()
-			// if reply.Success {
-			// 	rf.nextIndex[pi] = len(rf.log)
-			// 	rf.matchIndex[pi] = args.PrevLogIndex // + len(args.Entries) == 0
-			// }
-			// if reply.Term > rf.currentTerm {
-			// 	rf.revertToFollower(args.Term)
-			// }
 		}(pi)
 	}
 }
@@ -541,8 +525,8 @@ func (rf *Raft) forwardAppendEntries() {
 					}
 
 					go func(pi int) {
-						// rf.batchLocks[pi].Lock()
-						// defer rf.batchLocks[pi].Unlock()
+						// rf.batchMu[pi].Lock()
+						// defer rf.batchMu[pi].Unlock()
 
 						args := *rargs
 
@@ -559,7 +543,8 @@ func (rf *Raft) forwardAppendEntries() {
 								return
 							}
 
-							DPrintf("%v - %v sent to %v RequestVote RPC: %v", rf.state, rf.me, pi, &args)
+							DPrintf("%v - %v sent to %v RequestVote RPC as part of forward: %v",
+								rf.state, rf.me, pi, &args)
 
 							if !rf.peers[pi].Call("Raft.AppendEntries", &args, &reply) {
 								sendAck <- appendNotSent
@@ -567,7 +552,8 @@ func (rf *Raft) forwardAppendEntries() {
 								return
 							}
 
-							DPrintf("%v - %v received from %v AppendEntries RPC reply: %v", rf.state, rf.me, pi, &reply)
+							DPrintf("%v - %v received from %v AppendEntries RPC reply as part of forward: %v",
+								rf.state, rf.me, pi, &reply)
 
 							rf.mu.Lock()
 							if reply.Success {
@@ -711,6 +697,9 @@ func (rf *Raft) AppendEntries(
 		}
 	}
 
+	DPrintf("%v with rf.commitIndex: %v, rf.lastApplied: %v, rf.log: %v",
+		rf.me, rf.commitIndex, rf.lastApplied, rf.log)
+
 	rf.applyCommands()
 
 	reply.Success = true
@@ -807,7 +796,14 @@ func Make(
 	rf.signalElectionTimeout = make(chan struct{}, len(peers))
 	rf.signalElectionHalt = make(chan struct{}, len(peers))
 	rf.batches = make(chan *AppendEntriesArgs, batchSz)
-	rf.batchLocks = make([]sync.Mutex, len(peers))
+	rf.batchMu = make([]*sync.Mutex, len(peers))
+	for pi := 0; pi < len(rf.peers); pi++ {
+		if pi == rf.me {
+			continue
+		}
+
+		rf.batchMu[pi] = &sync.Mutex{}
+	}
 
 	rf.log = []Entry{{}}
 	rf.votedFor = -1
