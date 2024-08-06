@@ -161,7 +161,6 @@ type Raft struct {
 	signalElectionHalt    chan struct{}
 	electing              int32
 	batches               chan *AppendEntriesArgs
-	batchMu               []*sync.Mutex
 
 	// Persistent state
 	currentTerm int
@@ -242,9 +241,6 @@ func (rf *Raft) fireHeartbeat() {
 		}
 
 		go func(pi int) {
-			// rf.batchMu[pi].Lock()
-			// defer rf.batchMu[pi].Unlock()
-
 			args := *rargs
 			for {
 				reply := AppendEntriesReply{}
@@ -528,9 +524,6 @@ func (rf *Raft) forwardAppendEntries() {
 					}
 
 					go func(pi int) {
-						// rf.batchMu[pi].Lock()
-						// defer rf.batchMu[pi].Unlock()
-
 						args := *rargs
 
 						for {
@@ -799,14 +792,6 @@ func Make(
 	rf.signalElectionTimeout = make(chan struct{}, len(peers))
 	rf.signalElectionHalt = make(chan struct{}, len(peers))
 	rf.batches = make(chan *AppendEntriesArgs, batchSz)
-	rf.batchMu = make([]*sync.Mutex, len(peers))
-	for pi := 0; pi < len(rf.peers); pi++ {
-		if pi == rf.me {
-			continue
-		}
-
-		rf.batchMu[pi] = &sync.Mutex{}
-	}
 
 	rf.log = []Entry{{}}
 	rf.votedFor = -1
