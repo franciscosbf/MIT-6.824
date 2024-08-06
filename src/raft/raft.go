@@ -309,6 +309,14 @@ func (rf *Raft) fireVote() bool {
 
 	func() {
 		atomic.StoreInt32(&rf.electing, 0)
+
+		for {
+			select {
+			case <-rf.signalElectionHalt: // drain channel
+			default:
+				return
+			}
+		}
 	}()
 
 	DPrintf("%v - %v started an election", rf.state, rf.me)
@@ -383,6 +391,7 @@ func (rf *Raft) fireVote() bool {
 				rf.mu.Lock()
 				rf.state = leader
 				for pi := 0; pi < len(rf.peers); pi++ {
+					rf.matchIndex[pi] = 0
 					rf.nextIndex[pi] = len(rf.log)
 				}
 				rf.mu.Unlock()
@@ -459,7 +468,11 @@ func (rf *Raft) revertToFollower(term int) {
 
 func (rf *Raft) evaluateTermOnRPC(term int) {
 	if term > rf.currentTerm {
+		rf.haltElection()
 		rf.revertToFollower(term)
+	}
+
+	if rf.state != leader {
 		rf.resetElectionTimeout()
 	}
 }
@@ -467,7 +480,8 @@ func (rf *Raft) evaluateTermOnRPC(term int) {
 func (rf *Raft) applyCommands() {
 	for rf.commitIndex > rf.lastApplied {
 		rf.lastApplied++
-		DPrintf("%v - %v applied index %v", rf.state, rf.me, rf.lastApplied)
+		DPrintf("%v - %v applied command %v at index %v",
+			rf.state, rf.me, rf.log[rf.lastApplied].Command, rf.lastApplied)
 		rf.applyCh <- ApplyMsg{
 			CommandValid: true,
 			Command:      rf.log[rf.lastApplied].Command,
