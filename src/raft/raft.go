@@ -255,7 +255,7 @@ func (rf *Raft) fireHeartbeat() {
 			for {
 				reply := AppendEntriesReply{}
 
-				DPrintf("%v - %v sent to %v AppendEntries RPC as part of heartbeat: %v",
+				DPrintf("%v - %v tried to sent to %v AppendEntries RPC as part of heartbeat: %v",
 					rf.state, rf.me, pi, &args)
 
 				if !rf.peers[pi].Call("Raft.AppendEntries", &args, &reply) {
@@ -384,7 +384,7 @@ retry:
 			}
 
 			go func(pi int) {
-				DPrintf("%v - %v sent to %v RequestVote RPC: %v", rf.state, rf.me, pi, &args)
+				DPrintf("%v - %v tried to send to %v RequestVote RPC: %v", rf.state, rf.me, pi, &args)
 
 				reply := RequestVoteReply{}
 
@@ -622,7 +622,7 @@ func (rf *Raft) batchAppendEntries() {
 								return
 							}
 
-							DPrintf("%v - %v sent to %v AppendEntries RPC as part of forward: %v",
+							DPrintf("%v - %v tried to send to %v AppendEntries RPC as part of forward: %v",
 								rf.state, rf.me, pi, &args)
 
 							if !rf.peers[pi].Call("Raft.AppendEntries", &args, &reply) {
@@ -732,8 +732,10 @@ func (rf *Raft) RequestVote(
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		args.LastLogIndex < len(rf.log) &&
-		((rf.log[args.LastLogIndex].Term != args.LastLogTerm && args.LastLogTerm > rf.log[len(rf.log)-1].Term) ||
-			(rf.log[args.LastLogIndex].Term == args.LastLogTerm && args.LastLogIndex+1 >= len(rf.log))) {
+		((rf.log[args.LastLogIndex].Term != args.LastLogTerm &&
+			args.LastLogTerm > rf.log[len(rf.log)-1].Term) ||
+			(rf.log[args.LastLogIndex].Term == args.LastLogTerm &&
+				args.LastLogIndex+1 >= len(rf.log))) {
 
 		rf.votedFor = args.CandidateId
 
