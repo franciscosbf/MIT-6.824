@@ -15,8 +15,8 @@ import (
 const (
 	heartbeatTimeout = time.Millisecond * 200
 
-	electionTimeoutMin = time.Millisecond * 450
-	electionTimeoutMax = time.Millisecond * 600
+	electionTimeoutMin = time.Millisecond * 650
+	electionTimeoutMax = time.Millisecond * 800
 
 	batchSz = 128
 
@@ -60,12 +60,21 @@ const (
 	resumeHeartbeat
 )
 
+type electionTimeoutState int
+
+const (
+	stopElectionTimeout electionTimeoutState = iota
+	resumeElectionTimeout
+	resetElectionTimeout
+)
+
 type appendState int
 
 const (
 	appendSent appendState = iota
 	appendNotSent
 	backToFollower
+	abort
 )
 
 type Entry struct {
@@ -159,7 +168,7 @@ type Raft struct {
 	state                 peerState
 	signalKill            chan struct{}
 	signalHeartbeat       chan hearbeatState
-	signalElectionTimeout chan struct{}
+	signalElectionTimeout chan electionTimeoutState
 	signalElectionHalt    chan struct{}
 	electing              int32
 	batches               chan *AppendEntriesArgs
@@ -227,7 +236,6 @@ func (rf *Raft) fireHeartbeat() {
 	rf.mu.Lock()
 	prevLogIndex := len(rf.log) - 1
 	rargs := &AppendEntriesArgs{
-		// args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: prevLogIndex,
@@ -246,9 +254,6 @@ func (rf *Raft) fireHeartbeat() {
 			args := *rargs
 			for {
 				reply := AppendEntriesReply{}
-
-				// DPrintf("%v with rf.commitIndex: %v, rf.lastApplied: %v, rf.log: %v",
-				// 	rf.me, rf.commitIndex, rf.lastApplied, rf.log)
 
 				DPrintf("%v - %v sent to %v AppendEntries RPC as part of heartbeat: %v",
 					rf.state, rf.me, pi, &args)
@@ -351,11 +356,12 @@ func (rf *Raft) fireVote() bool {
 
 	DPrintf("%v - %v started an election", rf.state, rf.me)
 
+retry:
 	for {
-	retry:
 		rf.mu.Lock()
 		rf.currentTerm++
 		rf.state = candidate
+		rf.votedFor = rf.me
 		lastLogIndex := len(rf.log) - 1
 		args := RequestVoteArgs{
 			Term:         rf.currentTerm,
@@ -386,7 +392,8 @@ func (rf *Raft) fireVote() bool {
 					return
 				}
 
-				DPrintf("%v - %v received from %v RequestVote RPC reply: %v", rf.state, rf.me, pi, &reply)
+				DPrintf("%v - %v received from %v RequestVote RPC reply: %v",
+					rf.state, rf.me, pi, &reply)
 
 				if reply.VoteGranted {
 					DPrintf("%v - %v got vote granted from %v", rf.state, rf.me, pi)
@@ -426,7 +433,6 @@ func (rf *Raft) fireVote() bool {
 				}
 				rf.mu.Unlock()
 
-				rf.fireHeartbeat()
 				rf.resumeHeartBeat()
 
 				DPrintf("%v - %v has become leader with a majority of the votes", rf.state, rf.me)
@@ -434,6 +440,7 @@ func (rf *Raft) fireVote() bool {
 				return true
 			case <-timer:
 				goto retry
+			case <-rf.signalElectionTimeout: // drain channel
 			}
 		}
 	}
@@ -446,6 +453,8 @@ func (rf *Raft) electionTimeout() {
 
 		DPrintf("%v - %v started election timeout with %v", rf.state, rf.me, timeout)
 
+		var state electionTimeoutState
+
 		for {
 			select {
 			case <-rf.signalKill:
@@ -454,16 +463,41 @@ func (rf *Raft) electionTimeout() {
 				rf.stopHeartbeat()
 
 				if elected := rf.fireVote(); elected {
-					select {
-					case <-rf.signalKill:
-						return
-					case <-rf.signalElectionTimeout:
-						DPrintf("%v - %v resumed election timeout", rf.state, rf.me)
+					for {
+						select {
+						case <-rf.signalKill:
+							return
+						case state = <-rf.signalElectionTimeout:
+						}
+
+						if state == resumeElectionTimeout {
+
+							DPrintf("%v - %v resumed election timeout", rf.state, rf.me)
+							break
+						}
 					}
 				}
 
 				DPrintf("%v - %v proceeds to restart election", rf.state, rf.me)
-			case <-rf.signalElectionTimeout:
+			case state = <-rf.signalElectionTimeout:
+				switch state {
+				case stopElectionTimeout:
+					for {
+						select {
+						case <-rf.signalKill:
+							return
+						case state = <-rf.signalElectionTimeout:
+							DPrintf("%v - %v resumed election timeout", rf.state, rf.me)
+						}
+
+						if state == resumeElectionTimeout {
+							break
+						}
+					}
+				case resumeElectionTimeout:
+					continue
+				case resetElectionTimeout:
+				}
 			}
 
 			timeout := genElectionTimeout()
@@ -474,8 +508,16 @@ func (rf *Raft) electionTimeout() {
 	}()
 }
 
+func (rf *Raft) resumeElectionTimeout() {
+	rf.signalElectionTimeout <- resumeElectionTimeout
+}
+
 func (rf *Raft) resetElectionTimeout() {
-	rf.signalElectionTimeout <- struct{}{}
+	rf.signalElectionTimeout <- resetElectionTimeout
+}
+
+func (rf *Raft) stopElectionTimeout() {
+	rf.signalElectionTimeout <- stopElectionTimeout
 }
 
 func (rf *Raft) haltElection() {
@@ -488,23 +530,13 @@ func (rf *Raft) haltElection() {
 
 func (rf *Raft) revertToFollower(term int) {
 	rf.stopHeartbeat()
+	rf.resumeElectionTimeout()
 
 	DPrintf("%v - %v went back to follower state at term %v", rf.state, rf.me, term)
 
 	rf.currentTerm = term
 	rf.state = follower
 	rf.votedFor = -1
-}
-
-func (rf *Raft) evaluateTermOnRPC(term int) {
-	if term > rf.currentTerm {
-		rf.haltElection()
-		rf.revertToFollower(term)
-	}
-
-	if rf.state != leader {
-		rf.resetElectionTimeout()
-	}
 }
 
 func (rf *Raft) applyCommands() {
@@ -572,6 +604,12 @@ func (rf *Raft) batchAppendEntries() {
 							reply := AppendEntriesReply{}
 
 							rf.mu.Lock()
+							if rf.state != leader {
+								sendAck <- abort
+								rf.mu.Unlock()
+
+								return
+							}
 							send := len(rf.log)-1 >= rf.nextIndex[pi]
 							rf.mu.Unlock()
 
@@ -581,7 +619,7 @@ func (rf *Raft) batchAppendEntries() {
 								return
 							}
 
-							DPrintf("%v - %v sent to %v RequestVote RPC as part of forward: %v",
+							DPrintf("%v - %v sent to %v AppendEntries RPC as part of forward: %v",
 								rf.state, rf.me, pi, &args)
 
 							if !rf.peers[pi].Call("Raft.AppendEntries", &args, &reply) {
@@ -632,8 +670,7 @@ func (rf *Raft) batchAppendEntries() {
 							break confirmations
 						}
 					case appendNotSent:
-					case backToFollower:
-						rf.resetElectionTimeout()
+					case backToFollower, abort:
 						return
 					}
 				}
@@ -684,15 +721,23 @@ func (rf *Raft) RequestVote(
 		return
 	}
 
-	rf.evaluateTermOnRPC(args.Term)
+	if args.Term > rf.currentTerm {
+		rf.haltElection()
+		rf.revertToFollower(args.Term)
+	}
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
-		len(rf.log)-1 == args.LastLogIndex &&
-		rf.log[args.LastLogIndex].Term == args.LastLogTerm {
-
-		reply.VoteGranted = true
+		args.LastLogIndex < len(rf.log) &&
+		((rf.log[args.LastLogIndex].Term != args.LastLogTerm && args.LastLogTerm > rf.log[len(rf.log)-1].Term) ||
+			(rf.log[args.LastLogIndex].Term == args.LastLogTerm && args.LastLogIndex+1 >= len(rf.log))) {
 
 		rf.votedFor = args.CandidateId
+
+		if rf.state != leader {
+			rf.resetElectionTimeout()
+		}
+
+		reply.VoteGranted = true
 	}
 }
 
@@ -713,10 +758,16 @@ func (rf *Raft) AppendEntries(
 		return
 	}
 
-	rf.evaluateTermOnRPC(args.Term)
+	if args.Term >= rf.currentTerm {
+		if rf.state == candidate || args.Term > rf.currentTerm {
+			rf.haltElection()
+			rf.revertToFollower(args.Term)
+		}
+	}
 
-	// DPrintf("%v with rf.commitIndex: %v, rf.lastApplied: %v, rf.log: %v",
-	// 	rf.me, rf.commitIndex, rf.lastApplied, rf.log)
+	if rf.state != leader {
+		rf.resetElectionTimeout()
+	}
 
 	if args.PrevLogIndex >= len(rf.log) ||
 		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -827,7 +878,7 @@ func Make(
 	rf.state = follower
 	rf.signalKill = make(chan struct{})
 	rf.signalHeartbeat = make(chan hearbeatState, len(peers))
-	rf.signalElectionTimeout = make(chan struct{}, len(peers))
+	rf.signalElectionTimeout = make(chan electionTimeoutState, len(peers))
 	rf.signalElectionHalt = make(chan struct{}, len(peers))
 	rf.batches = make(chan *AppendEntriesArgs, batchSz)
 
