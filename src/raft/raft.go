@@ -20,7 +20,7 @@ const (
 
 	batchSz = 128
 
-	applyCommandsTimeout = time.Second
+	applyCommandsTimeout = time.Millisecond * 100
 )
 
 func genElectionTimeout() time.Duration {
@@ -431,9 +431,8 @@ retry:
 					rf.matchIndex[pi] = 0
 					rf.nextIndex[pi] = len(rf.log)
 				}
-				rf.mu.Unlock()
-
 				rf.resumeHeartBeat()
+				rf.mu.Unlock()
 
 				DPrintf("%v - %v has become leader with a majority of the votes", rf.state, rf.me)
 
@@ -540,6 +539,37 @@ func (rf *Raft) revertToFollower(term int) {
 }
 
 func (rf *Raft) applyCommands() {
+	if rf.state == leader {
+		N := len(rf.log) - 1
+	commitIdxCheck:
+		for ; N > 0; N-- {
+			if rf.log[N].Term == rf.currentTerm && N > rf.commitIndex {
+				greater := 0
+				for _, mi := range rf.matchIndex {
+					if mi >= N {
+						if greater++; greater == rf.majority {
+							rf.commitIndex = N
+
+							break commitIdxCheck
+						}
+					}
+				}
+			}
+		}
+	}
+	for rf.commitIndex > rf.lastApplied {
+		rf.lastApplied++
+		DPrintf("%v - %v applied entry %v at index %v",
+			rf.state, rf.me, rf.log[rf.lastApplied], rf.lastApplied)
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[rf.lastApplied].Command,
+			CommandIndex: rf.lastApplied,
+		}
+	}
+}
+
+func (rf *Raft) applyCommandsPeriodically() {
 	go func() {
 		for {
 			select {
@@ -551,34 +581,7 @@ func (rf *Raft) applyCommands() {
 			time.Sleep(applyCommandsTimeout)
 
 			rf.mu.Lock()
-			if rf.state == leader {
-				N := len(rf.log) - 1
-			commitIdxCheck:
-				for ; N > 0; N-- {
-					if rf.log[N].Term == rf.currentTerm && N > rf.commitIndex {
-						greater := 0
-						for _, mi := range rf.matchIndex {
-							if mi >= N {
-								if greater++; greater == rf.majority {
-									rf.commitIndex = N
-
-									break commitIdxCheck
-								}
-							}
-						}
-					}
-				}
-			}
-			for rf.commitIndex > rf.lastApplied {
-				rf.lastApplied++
-				DPrintf("%v - %v applied entry %v at index %v",
-					rf.state, rf.me, rf.log[rf.lastApplied], rf.lastApplied)
-				rf.applyCh <- ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[rf.lastApplied].Command,
-					CommandIndex: rf.lastApplied,
-				}
-			}
+			rf.applyCommands()
 			rf.mu.Unlock()
 		}
 	}()
@@ -696,6 +699,7 @@ func (rf *Raft) batchAppendEntries() {
 						}
 					}
 				}
+				rf.applyCommands()
 				rf.mu.Unlock()
 			}
 		}
@@ -786,6 +790,8 @@ func (rf *Raft) AppendEntries(
 			rf.commitIndex = lastNewEntryIndex
 		}
 	}
+
+	rf.applyCommands()
 
 	reply.Success = true
 }
@@ -893,7 +899,7 @@ func Make(
 	rf.hearbeat()
 	rf.electionTimeout()
 	rf.batchAppendEntries()
-	rf.applyCommands()
+	rf.applyCommandsPeriodically()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
