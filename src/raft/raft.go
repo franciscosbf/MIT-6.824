@@ -877,9 +877,9 @@ func Make(
 	rf.majority = calcMajority(len(peers))
 	rf.state = follower
 	rf.signalKill = make(chan struct{})
-	rf.signalHeartbeat = make(chan hearbeatState, len(peers))
-	rf.signalElectionTimeout = make(chan electionTimeoutState, len(peers))
-	rf.signalElectionHalt = make(chan struct{}, len(peers))
+	rf.signalHeartbeat = make(chan hearbeatState, 1)
+	rf.signalElectionTimeout = make(chan electionTimeoutState, 1)
+	rf.signalElectionHalt = make(chan struct{}, 1)
 	rf.batches = make(chan *AppendEntriesArgs, batchSz)
 
 	rf.log = []Entry{{}}
