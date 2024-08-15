@@ -58,6 +58,7 @@ type hearbeatState int
 const (
 	stopHeartbeat hearbeatState = iota
 	resumeHeartbeat
+	immediateHeartbeat
 )
 
 type electionTimeoutState int
@@ -323,9 +324,15 @@ func (rf *Raft) hearbeat() {
 			case state = <-rf.signalHeartbeat:
 			}
 
-			if state == resumeHeartbeat {
-				break
+			switch state {
+			case immediateHeartbeat:
+				rf.fireHeartbeat()
+			case resumeHeartbeat:
+			default:
+				continue
 			}
+
+			break
 		}
 
 		DPrintf("%v - %v proceeds to resume heartbeat", rf.state, rf.me)
@@ -346,6 +353,8 @@ func (rf *Raft) hearbeat() {
 				DPrintf("%v - %v stopped heartbeat", rf.state, rf.me)
 
 				goto stopped
+			case immediateHeartbeat:
+				rf.fireHeartbeat()
 			case resumeHeartbeat:
 			}
 		}
@@ -358,6 +367,10 @@ func (rf *Raft) stopHeartbeat() {
 
 func (rf *Raft) resumeHeartBeat() {
 	rf.signalHeartbeat <- resumeHeartbeat
+}
+
+func (rf *Raft) immediateHeartBeat() {
+	rf.signalHeartbeat <- immediateHeartbeat
 }
 
 func (rf *Raft) fireVote() bool {
@@ -453,7 +466,7 @@ retry:
 					rf.matchIndex[pi] = 0
 					rf.nextIndex[pi] = len(rf.log)
 				}
-				rf.resumeHeartBeat()
+				rf.immediateHeartBeat()
 				rf.mu.Unlock()
 
 				DPrintf("%v - %v has become leader with a majority of the votes", rf.state, rf.me)
