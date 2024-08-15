@@ -174,6 +174,7 @@ type Raft struct {
 	electing              int32
 	batches               chan *AppendEntriesArgs
 	sending               []*int32
+	sendingAlert          []*sync.Cond
 
 	// Persistent state
 	currentTerm int
@@ -253,7 +254,7 @@ func (rf *Raft) fireHeartbeat() {
 		}
 
 		go func(pi int) {
-			if atomic.LoadInt32(rf.sending[pi]) == 1 {
+			if !atomic.CompareAndSwapInt32(rf.sending[pi], 0, 1) {
 				return
 			}
 
@@ -267,6 +268,9 @@ func (rf *Raft) fireHeartbeat() {
 
 			var success bool
 			defer func() {
+				atomic.StoreInt32(rf.sending[pi], 0)
+				rf.sendingAlert[pi].Signal()
+
 				if !success {
 					return
 				}
@@ -639,7 +643,12 @@ func (rf *Raft) batchAppendEntries() {
 					}
 
 					go func(pi int) {
-						atomic.StoreInt32(rf.sending[pi], 1)
+						rf.sendingAlert[pi].L.Lock()
+						for !atomic.CompareAndSwapInt32(rf.sending[pi], 0, 1) {
+							rf.sendingAlert[pi].Wait()
+						}
+						rf.sendingAlert[pi].L.Unlock()
+
 						defer atomic.StoreInt32(rf.sending[pi], 0)
 
 						args := *rargs
@@ -923,8 +932,10 @@ func Make(
 	rf.batches = make(chan *AppendEntriesArgs, batchSz)
 
 	rf.sending = make([]*int32, len(peers))
+	rf.sendingAlert = make([]*sync.Cond, len(peers))
 	for pi := 0; pi < len(rf.peers); pi++ {
 		rf.sending[pi] = new(int32)
+		rf.sendingAlert[pi] = sync.NewCond(&sync.Mutex{})
 	}
 
 	rf.log = []Entry{{}}
