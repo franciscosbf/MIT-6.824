@@ -13,10 +13,10 @@ import (
 // import "../labgob"
 
 const (
-	heartbeatTimeout = time.Millisecond * 200
+	heartbeatTimeout = time.Millisecond * 100
 
-	electionTimeoutMin = time.Millisecond * 650
-	electionTimeoutMax = time.Millisecond * 800
+	electionTimeoutMin = time.Millisecond * 350
+	electionTimeoutMax = time.Millisecond * 500
 
 	batchSz = 128
 
@@ -251,7 +251,27 @@ func (rf *Raft) fireHeartbeat() {
 		}
 
 		go func(pi int) {
+			var success bool
+
 			args := *rargs
+			rf.mu.Lock()
+			prevLogIndex := rf.nextIndex[pi] - 1
+			args.PrevLogIndex = prevLogIndex
+			args.PrevLogTerm = rf.log[prevLogIndex].Term
+			args.Entries = rf.log[prevLogIndex+1:]
+			rf.mu.Unlock()
+
+			defer func() {
+				if !success {
+					return
+				}
+
+				rf.mu.Lock()
+				rf.commitIdxCheck()
+				rf.tryToApplyCommands()
+				rf.mu.Unlock()
+			}()
+
 			for {
 				reply := AppendEntriesReply{}
 
@@ -270,6 +290,8 @@ func (rf *Raft) fireHeartbeat() {
 					rf.nextIndex[pi] = len(rf.log)
 					rf.matchIndex[pi] = args.PrevLogIndex + len(args.Entries)
 					rf.mu.Unlock()
+
+					success = true
 
 					return
 				}
@@ -538,25 +560,26 @@ func (rf *Raft) revertToFollower(term int) {
 	rf.votedFor = -1
 }
 
-func (rf *Raft) applyCommands() {
-	if rf.state == leader {
-		N := len(rf.log) - 1
-	commitIdxCheck:
-		for ; N > 0; N-- {
-			if rf.log[N].Term == rf.currentTerm && N > rf.commitIndex {
-				greater := 0
-				for _, mi := range rf.matchIndex {
-					if mi >= N {
-						if greater++; greater == rf.majority {
-							rf.commitIndex = N
+func (rf *Raft) commitIdxCheck() {
+	N := len(rf.log) - 1
+check:
+	for ; N > 0; N-- {
+		if rf.log[N].Term == rf.currentTerm && N > rf.commitIndex {
+			greater := 0
+			for _, mi := range rf.matchIndex {
+				if mi >= N {
+					if greater++; greater == rf.majority {
+						rf.commitIndex = N
 
-							break commitIdxCheck
-						}
+						break check
 					}
 				}
 			}
 		}
 	}
+}
+
+func (rf *Raft) tryToApplyCommands() {
 	for rf.commitIndex > rf.lastApplied {
 		rf.lastApplied++
 		DPrintf("%v - %v applied entry %v at index %v",
@@ -569,31 +592,21 @@ func (rf *Raft) applyCommands() {
 	}
 }
 
-func (rf *Raft) applyCommandsPeriodically() {
-	go func() {
-		for {
-			select {
-			case <-rf.signalKill:
-				return
-			default:
-			}
-
-			time.Sleep(applyCommandsTimeout)
-
-			rf.mu.Lock()
-			rf.applyCommands()
-			rf.mu.Unlock()
-		}
-	}()
-}
-
 func (rf *Raft) batchAppendEntries() {
 	go func() {
 		for {
+		waiting:
 			select {
 			case <-rf.signalKill:
 				return
 			case rargs := <-rf.batches:
+				rf.mu.Lock()
+				if rf.state != leader {
+					rf.mu.Unlock()
+					continue
+				}
+				rf.mu.Unlock()
+
 				sendAck := make(chan appendState, len(rf.peers))
 
 				for pi := 0; pi < len(rf.peers); pi++ {
@@ -603,6 +616,13 @@ func (rf *Raft) batchAppendEntries() {
 
 					go func(pi int) {
 						args := *rargs
+						rf.mu.Lock()
+						prevLogIndex := rf.nextIndex[pi] - 1
+						args.PrevLogIndex = prevLogIndex
+						args.PrevLogTerm = rf.log[prevLogIndex].Term
+						args.Entries = rf.log[prevLogIndex+1:]
+						rf.mu.Unlock()
+
 						for {
 							reply := AppendEntriesReply{}
 
@@ -674,7 +694,7 @@ func (rf *Raft) batchAppendEntries() {
 						}
 					case appendNotSent:
 					case backToFollower, abort:
-						return
+						goto waiting
 					}
 				}
 
@@ -683,23 +703,8 @@ func (rf *Raft) batchAppendEntries() {
 				}
 
 				rf.mu.Lock()
-				N := len(rf.log) - 1
-			commitIdxCheck:
-				for ; N > 0; N-- {
-					if rf.log[N].Term == rf.currentTerm && N > rf.commitIndex {
-						greater := 0
-						for _, mi := range rf.matchIndex {
-							if mi >= N {
-								if greater++; greater == rf.majority {
-									rf.commitIndex = N
-
-									break commitIdxCheck
-								}
-							}
-						}
-					}
-				}
-				rf.applyCommands()
+				rf.commitIdxCheck()
+				rf.tryToApplyCommands()
 				rf.mu.Unlock()
 			}
 		}
@@ -793,7 +798,7 @@ func (rf *Raft) AppendEntries(
 		}
 	}
 
-	rf.applyCommands()
+	rf.tryToApplyCommands()
 
 	reply.Success = true
 }
@@ -901,7 +906,6 @@ func Make(
 	rf.hearbeat()
 	rf.electionTimeout()
 	rf.batchAppendEntries()
-	rf.applyCommandsPeriodically()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
