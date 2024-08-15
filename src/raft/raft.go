@@ -173,6 +173,7 @@ type Raft struct {
 	signalElectionHalt    chan struct{}
 	electing              int32
 	batches               chan *AppendEntriesArgs
+	sending               []*int32
 
 	// Persistent state
 	currentTerm int
@@ -252,7 +253,9 @@ func (rf *Raft) fireHeartbeat() {
 		}
 
 		go func(pi int) {
-			var success bool
+			if atomic.LoadInt32(rf.sending[pi]) == 1 {
+				return
+			}
 
 			args := *rargs
 			rf.mu.Lock()
@@ -262,6 +265,7 @@ func (rf *Raft) fireHeartbeat() {
 			args.Entries = rf.log[prevLogIndex+1:]
 			rf.mu.Unlock()
 
+			var success bool
 			defer func() {
 				if !success {
 					return
@@ -635,6 +639,9 @@ func (rf *Raft) batchAppendEntries() {
 					}
 
 					go func(pi int) {
+						atomic.StoreInt32(rf.sending[pi], 1)
+						defer atomic.StoreInt32(rf.sending[pi], 0)
+
 						args := *rargs
 						rf.mu.Lock()
 						prevLogIndex := rf.nextIndex[pi] - 1
@@ -914,6 +921,11 @@ func Make(
 	rf.signalElectionTimeout = make(chan electionTimeoutState, 1)
 	rf.signalElectionHalt = make(chan struct{}, 1)
 	rf.batches = make(chan *AppendEntriesArgs, batchSz)
+
+	rf.sending = make([]*int32, len(peers))
+	for pi := 0; pi < len(rf.peers); pi++ {
+		rf.sending[pi] = new(int32)
+	}
 
 	rf.log = []Entry{{}}
 	rf.votedFor = -1
