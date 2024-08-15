@@ -274,6 +274,13 @@ func (rf *Raft) fireHeartbeat() {
 			}()
 
 			for {
+				rf.mu.Lock()
+				if rf.state != leader {
+					rf.mu.Unlock()
+					return
+				}
+				rf.mu.Unlock()
+
 				reply := AppendEntriesReply{}
 
 				DPrintf("%v - %v tried to sent to %v AppendEntries RPC as part of heartbeat: %v",
