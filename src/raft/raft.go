@@ -580,6 +580,7 @@ func (rf *Raft) haltElection() {
 func (rf *Raft) revertToFollower(term int) {
 	rf.stopHeartbeat()
 	rf.resumeElectionTimeout()
+	rf.releasePendingSenders()
 
 	DPrintf("%v - %v went back to follower state at term %v", rf.state, rf.me, term)
 
@@ -745,6 +746,12 @@ func (rf *Raft) batchAppendEntries() {
 			}
 		}
 	}()
+}
+
+func (rf *Raft) releasePendingSenders() {
+	for _, sa := range rf.sendingAlert {
+		sa.Broadcast()
+	}
 }
 
 func (rf *Raft) RequestVote(
@@ -930,7 +937,6 @@ func Make(
 	rf.signalElectionTimeout = make(chan electionTimeoutState, 1)
 	rf.signalElectionHalt = make(chan struct{}, 1)
 	rf.batches = make(chan *AppendEntriesArgs, batchSz)
-
 	rf.sending = make([]*int32, len(peers))
 	rf.sendingAlert = make([]*sync.Cond, len(peers))
 	for pi := 0; pi < len(rf.peers); pi++ {
