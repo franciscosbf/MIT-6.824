@@ -126,9 +126,21 @@ func (rva *AppendEntriesArgs) String() string {
 		rva.Term, rva.LeaderId, rva.PrevLogIndex, rva.PrevLogTerm, rva.Entries, rva.LeaderCommit)
 }
 
+type ConflictingEntry struct {
+	Term  int
+	Index int
+}
+
+type RecoveryTrace struct {
+	Entry ConflictingEntry
+	Len   int
+}
+
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	Trace RecoveryTrace
 }
 
 func (rva *AppendEntriesReply) String() string {
@@ -235,6 +247,57 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+func (rf *Raft) setFirstRecoveryEntry(
+	argsToUpdate *AppendEntriesArgs,
+	trace *RecoveryTrace,
+) (peerNextIndex int) {
+	go func() {
+		argsToUpdate.PrevLogIndex = peerNextIndex - 1
+		argsToUpdate.PrevLogTerm = rf.log[argsToUpdate.PrevLogIndex].Term
+		argsToUpdate.Entries = rf.log[peerNextIndex:]
+	}()
+
+	if trace.Entry == (ConflictingEntry{}) {
+		peerNextIndex = trace.Len
+
+		return
+	}
+
+	entry := trace.Entry
+
+	low, high := 0, len(rf.log)-1
+	index := -1
+	for low <= high {
+		mid := low + (high-low)/2
+		if rf.log[mid].Term == entry.Term {
+			index = mid
+
+			break
+		}
+		if rf.log[mid].Term < entry.Term {
+			low++
+		} else {
+			high--
+		}
+	}
+
+	if index == -1 {
+		peerNextIndex = entry.Index
+
+		return
+	}
+
+	i := index
+	for last := len(rf.log) - 1; i < last; i++ {
+		if rf.log[i+1].Term != entry.Term {
+			break
+		}
+	}
+	peerNextIndex = i
+
+	return
+}
+
 func (rf *Raft) fireHeartbeat() {
 	rf.mu.Lock()
 	prevLogIndex := len(rf.log) - 1
@@ -317,10 +380,7 @@ func (rf *Raft) fireHeartbeat() {
 
 					return
 				}
-				args.PrevLogIndex--
-				rf.nextIndex[pi]--
-				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-				args.Entries = rf.log[args.PrevLogIndex+1:]
+				rf.nextIndex[pi] = rf.setFirstRecoveryEntry(&args, &reply.Trace)
 				rf.mu.Unlock()
 			}
 		}(pi)
@@ -709,10 +769,7 @@ func (rf *Raft) batchAppendEntries() {
 
 								return
 							}
-							args.PrevLogIndex--
-							rf.nextIndex[pi]--
-							args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-							args.Entries = rf.log[args.PrevLogIndex+1:]
+							rf.nextIndex[pi] = rf.setFirstRecoveryEntry(&args, &reply.Trace)
 							rf.mu.Unlock()
 						}
 					}(pi)
@@ -823,8 +880,22 @@ func (rf *Raft) AppendEntries(
 		rf.resetElectionTimeout()
 	}
 
-	if args.PrevLogIndex >= len(rf.log) ||
-		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.Trace.Len = len(rf.log)
+
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		entry := &reply.Trace.Entry
+		entry.Term = rf.log[args.PrevLogIndex].Term
+		index := args.PrevLogIndex
+		for ; index > 0; index-- {
+			if rf.log[index].Term != entry.Term {
+				break
+			}
+		}
+		entry.Index = index + 1
 
 		return
 	}
