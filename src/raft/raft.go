@@ -1,7 +1,9 @@
 package raft
 
 import (
+	"../labgob"
 	"../labrpc"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -9,18 +11,13 @@ import (
 	"time"
 )
 
-// import "bytes"
-// import "../labgob"
-
 const (
-	heartbeatTimeout = time.Millisecond * 100
-
+	heartbeatTimeout   = time.Millisecond * 100
 	electionTimeoutMin = time.Millisecond * 350
 	electionTimeoutMax = time.Millisecond * 500
 
-	batchSz = 128
-
-	applyCommandsTimeout = time.Millisecond * 100
+	batchStartSz       = 128
+	batchPersistenceSz = 10
 )
 
 func genElectionTimeout() time.Duration {
@@ -81,6 +78,18 @@ const (
 type Entry struct {
 	Term    int
 	Command interface{}
+}
+
+type PersistentState struct {
+	Log         []Entry
+	CurrentTerm int
+	VotedFor    int
+}
+
+func (ps *PersistentState) String() string {
+	return fmt.Sprintf(
+		"{Log: %v, CurrentTerm: %v, VotedFor: %v}",
+		ps.Log, ps.CurrentTerm, ps.VotedFor)
 }
 
 type RequestVoteArgs struct {
@@ -184,9 +193,10 @@ type Raft struct {
 	signalElectionTimeout chan electionTimeoutState
 	signalElectionHalt    chan struct{}
 	electing              int32
-	batches               chan *AppendEntriesArgs
+	sendBatch             chan *AppendEntriesArgs
 	sending               []*int32
 	sendingAlert          []*sync.Cond
+	persistenceBatch      chan chan struct{}
 
 	// Persistent state
 	currentTerm int
@@ -218,13 +228,26 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+
+	pstate := PersistentState{
+		Log:         rf.log,
+		CurrentTerm: rf.currentTerm,
+		VotedFor:    rf.votedFor,
+	}
+
+	writer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writer)
+	if err := encoder.Encode(pstate); err != nil {
+		DPrintf("%v failed to encode PersistentState: %v; reason: %v",
+			rf.me, pstate, err)
+
+		return
+	}
+
+	data := writer.Bytes()
+	rf.persister.SaveRaftState(data)
+
+	DPrintf("%v encoded PersistentState: %v", rf.me, &pstate)
 }
 
 // restore previously persisted state.
@@ -232,19 +255,28 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	reader := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(reader)
+
+	var pstate PersistentState
+
+	if err := decoder.Decode(&pstate); err != nil {
+		DPrintf("%v failed to decode PersistentState; reason: %v",
+			rf.me, err)
+
+		return
+	}
+
+	DPrintf("%v decoded PersistentState: %v", rf.me, &pstate)
+
+	if len(pstate.Log) == 0 {
+		return
+	}
+
+	rf.log = pstate.Log
+	rf.currentTerm = pstate.CurrentTerm
+	rf.votedFor = pstate.VotedFor
 }
 
 func (rf *Raft) setFirstRecoveryEntry(
@@ -264,10 +296,9 @@ func (rf *Raft) setFirstRecoveryEntry(
 	}
 
 	entry := trace.Entry
-
-	low, high := 0, len(rf.log)-1
 	index := -1
-	for low <= high {
+
+	for low, high := 0, len(rf.log)-1; low <= high; {
 		mid := low + (high-low)/2
 		if rf.log[mid].Term == entry.Term {
 			index = mid
@@ -440,7 +471,7 @@ func (rf *Raft) stopHeartbeat() {
 	rf.signalHeartbeat <- stopHeartbeat
 }
 
-func (rf *Raft) resumeHeartBeat() {
+func (rf *Raft) resumeHeartbeat() {
 	rf.signalHeartbeat <- resumeHeartbeat
 }
 
@@ -479,6 +510,7 @@ retry:
 			LastLogIndex: lastLogIndex,
 			LastLogTerm:  rf.log[lastLogIndex].Term,
 		}
+		rf.persist()
 		rf.mu.Unlock()
 
 		accepted := make(chan struct{}, len(rf.peers))
@@ -647,6 +679,7 @@ func (rf *Raft) revertToFollower(term int) {
 	rf.currentTerm = term
 	rf.state = follower
 	rf.votedFor = -1
+	rf.persist()
 }
 
 func (rf *Raft) commitIdxCheck() {
@@ -688,7 +721,7 @@ func (rf *Raft) batchAppendEntries() {
 			select {
 			case <-rf.signalKill:
 				return
-			case rargs := <-rf.batches:
+			case rargs := <-rf.sendBatch:
 				rf.mu.Lock()
 				if rf.state != leader {
 					rf.mu.Unlock()
@@ -811,6 +844,54 @@ func (rf *Raft) releasePendingSenders() {
 	}
 }
 
+func (rf *Raft) stateRecorder() {
+	go func() {
+		repliesBatch := make([]chan struct{}, batchPersistenceSz)
+
+		for {
+			select {
+			case <-rf.signalKill:
+				return
+			case reply := <-rf.persistenceBatch:
+				repliesBatch[0] = reply
+			}
+
+			batched := 1
+			timer := time.After(time.Microsecond * 200)
+			for ; batched < batchPersistenceSz; batched++ {
+				select {
+				case reply := <-rf.persistenceBatch:
+					repliesBatch[batched] = reply
+
+					continue
+					// default:
+				case <-timer:
+				}
+
+				break
+			}
+
+			rf.mu.Lock()
+			rf.persist()
+			rf.mu.Unlock()
+
+			for _, b := range repliesBatch[:batched] {
+				go func(b chan<- struct{}) {
+					b <- struct{}{}
+				}(b)
+			}
+		}
+	}()
+}
+
+func (rf *Raft) alertStateRecorder() {
+	reply := make(chan struct{}, 1)
+
+	rf.persistenceBatch <- reply
+
+	<-reply
+}
+
 func (rf *Raft) RequestVote(
 	args *RequestVoteArgs,
 	reply *RequestVoteReply,
@@ -822,9 +903,7 @@ func (rf *Raft) RequestVote(
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	defer func() {
-		reply.Term = rf.currentTerm
-	}()
+	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
 		return
@@ -837,12 +916,12 @@ func (rf *Raft) RequestVote(
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		args.LastLogIndex < len(rf.log) &&
-		((rf.log[args.LastLogIndex].Term != args.LastLogTerm &&
-			args.LastLogTerm > rf.log[len(rf.log)-1].Term) ||
-			(rf.log[args.LastLogIndex].Term == args.LastLogTerm &&
-				args.LastLogIndex+1 >= len(rf.log))) {
+		((rf.log[args.LastLogIndex].Term != args.LastLogTerm && args.LastLogTerm > rf.log[len(rf.log)-1].Term) ||
+			(rf.log[args.LastLogIndex].Term == args.LastLogTerm && args.LastLogIndex+1 >= len(rf.log))) {
 
 		rf.votedFor = args.CandidateId
+
+		rf.persist()
 
 		if rf.state != leader {
 			rf.resetElectionTimeout()
@@ -861,9 +940,7 @@ func (rf *Raft) AppendEntries(
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	defer func() {
-		reply.Term = rf.currentTerm
-	}()
+	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
 		return
@@ -903,6 +980,8 @@ func (rf *Raft) AppendEntries(
 	rf.log = rf.log[:args.PrevLogIndex+1]
 
 	rf.log = append(rf.log, args.Entries...)
+
+	rf.persist()
 
 	if args.LeaderCommit > rf.commitIndex {
 		if lastNewEntryIndex := len(rf.log) - 1; args.LeaderCommit < lastNewEntryIndex {
@@ -950,9 +1029,10 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 		LeaderCommit: rf.commitIndex,
 	}
 	rf.log = append(rf.log, entry)
+	rf.persist()
 	rf.mu.Unlock()
 
-	rf.batches <- rargs
+	rf.sendBatch <- rargs
 
 	return
 }
@@ -1007,13 +1087,14 @@ func Make(
 	rf.signalHeartbeat = make(chan hearbeatState, 1)
 	rf.signalElectionTimeout = make(chan electionTimeoutState, 1)
 	rf.signalElectionHalt = make(chan struct{}, 1)
-	rf.batches = make(chan *AppendEntriesArgs, batchSz)
+	rf.sendBatch = make(chan *AppendEntriesArgs, batchStartSz)
 	rf.sending = make([]*int32, len(peers))
 	rf.sendingAlert = make([]*sync.Cond, len(peers))
 	for pi := 0; pi < len(rf.peers); pi++ {
 		rf.sending[pi] = new(int32)
 		rf.sendingAlert[pi] = sync.NewCond(&sync.Mutex{})
 	}
+	rf.persistenceBatch = make(chan chan struct{}, batchPersistenceSz)
 
 	rf.log = []Entry{{}}
 	rf.votedFor = -1
@@ -1023,12 +1104,19 @@ func Make(
 	}
 	rf.matchIndex = make([]int, len(peers))
 
-	rf.hearbeat()
-	rf.electionTimeout()
-	rf.batchAppendEntries()
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	if rf.votedFor == rf.me {
+		rf.state = leader
+		rf.resumeHeartbeat()
+		rf.stopElectionTimeout()
+	}
+
+	rf.electionTimeout()
+	rf.hearbeat()
+	rf.batchAppendEntries()
+	// rf.stateRecorder()
 
 	return rf
 }
