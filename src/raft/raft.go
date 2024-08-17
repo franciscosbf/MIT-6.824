@@ -360,14 +360,10 @@ func (rf *Raft) fireHeartbeat() {
 			args.Entries = rf.log[prevLogIndex+1:]
 			rf.mu.Unlock()
 
-			var success bool
+			// var success bool
 			defer func() {
 				atomic.StoreInt32(rf.sending[pi], 0)
 				rf.sendingAlert[pi].Signal()
-
-				if !success {
-					return
-				}
 
 				rf.mu.Lock()
 				rf.commitIdxCheck()
@@ -400,8 +396,6 @@ func (rf *Raft) fireHeartbeat() {
 					rf.nextIndex[pi] = len(rf.log)
 					rf.matchIndex[pi] = args.PrevLogIndex + len(args.Entries)
 					rf.mu.Unlock()
-
-					success = true
 
 					return
 				}
