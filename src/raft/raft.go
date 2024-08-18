@@ -13,8 +13,8 @@ import (
 
 const (
 	heartbeatTimeout   = time.Millisecond * 100
-	electionTimeoutMin = time.Millisecond * 350
-	electionTimeoutMax = time.Millisecond * 500
+	electionTimeoutMin = time.Millisecond * 450
+	electionTimeoutMax = time.Millisecond * 600
 
 	batchStartSz       = 128
 	batchPersistenceSz = 10
@@ -29,7 +29,7 @@ func calcMajority(nPeers int) int {
 	return nPeers / 2
 }
 
-type peerState int
+type peerState int32
 
 const (
 	follower peerState = iota
@@ -251,7 +251,7 @@ func (rf *Raft) persist() {
 }
 
 // restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte) (success bool) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -277,6 +277,10 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.log = pstate.Log
 	rf.currentTerm = pstate.CurrentTerm
 	rf.votedFor = pstate.VotedFor
+
+	success = true
+
+	return
 }
 
 func (rf *Raft) setFirstRecoveryEntry(
@@ -289,7 +293,7 @@ func (rf *Raft) setFirstRecoveryEntry(
 		argsToUpdate.Entries = rf.log[peerNextIndex:]
 	}()
 
-	if trace.Entry == (ConflictingEntry{}) {
+	if trace.Entry == (ConflictingEntry{Term: -1, Index: -1}) {
 		peerNextIndex = trace.Len
 
 		return
@@ -299,16 +303,16 @@ func (rf *Raft) setFirstRecoveryEntry(
 	index := -1
 
 	for low, high := 0, len(rf.log)-1; low <= high; {
-		mid := low + (high-low)/2
+		mid := low + ((high - low) / 2)
 		if rf.log[mid].Term == entry.Term {
 			index = mid
 
 			break
 		}
 		if rf.log[mid].Term < entry.Term {
-			low++
+			low = mid + 1
 		} else {
-			high--
+			high = mid - 1
 		}
 	}
 
@@ -360,15 +364,16 @@ func (rf *Raft) fireHeartbeat() {
 			args.Entries = rf.log[prevLogIndex+1:]
 			rf.mu.Unlock()
 
-			// var success bool
 			defer func() {
+				rf.mu.Lock()
+				if rf.state == leader {
+					rf.commitIdxCheck()
+					rf.tryToApplyCommands()
+				}
+				rf.mu.Unlock()
+
 				atomic.StoreInt32(rf.sending[pi], 0)
 				rf.sendingAlert[pi].Signal()
-
-				rf.mu.Lock()
-				rf.commitIdxCheck()
-				rf.tryToApplyCommands()
-				rf.mu.Unlock()
 			}()
 
 			for {
@@ -677,10 +682,9 @@ func (rf *Raft) revertToFollower(term int) {
 }
 
 func (rf *Raft) commitIdxCheck() {
-	N := len(rf.log) - 1
 check:
-	for ; N > 0; N-- {
-		if rf.log[N].Term == rf.currentTerm && N > rf.commitIndex {
+	for N := rf.commitIndex + 1; N < len(rf.log); N++ {
+		if rf.log[N].Term == rf.currentTerm {
 			greater := 0
 			for _, mi := range rf.matchIndex {
 				if mi >= N {
@@ -737,7 +741,9 @@ func (rf *Raft) batchAppendEntries() {
 						}
 						rf.sendingAlert[pi].L.Unlock()
 
-						defer atomic.StoreInt32(rf.sending[pi], 0)
+						defer func() {
+							atomic.StoreInt32(rf.sending[pi], 0)
+						}()
 
 						args := *rargs
 						rf.mu.Lock()
@@ -824,8 +830,10 @@ func (rf *Raft) batchAppendEntries() {
 				}
 
 				rf.mu.Lock()
-				rf.commitIdxCheck()
-				rf.tryToApplyCommands()
+				if rf.state == leader {
+					rf.commitIdxCheck()
+					rf.tryToApplyCommands()
+				}
 				rf.mu.Unlock()
 			}
 		}
@@ -909,9 +917,9 @@ func (rf *Raft) RequestVote(
 	}
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
-		args.LastLogIndex < len(rf.log) &&
-		((rf.log[args.LastLogIndex].Term != args.LastLogTerm && args.LastLogTerm > rf.log[len(rf.log)-1].Term) ||
-			(rf.log[args.LastLogIndex].Term == args.LastLogTerm && args.LastLogIndex+1 >= len(rf.log))) {
+		// args.LastLogIndex < len(rf.log) &&
+		((rf.log[len(rf.log)-1].Term != args.LastLogTerm && args.LastLogTerm > rf.log[len(rf.log)-1].Term) ||
+			(rf.log[len(rf.log)-1].Term == args.LastLogTerm && args.LastLogIndex+1 >= len(rf.log))) {
 
 		rf.votedFor = args.CandidateId
 
@@ -930,6 +938,12 @@ func (rf *Raft) AppendEntries(
 	reply *AppendEntriesReply,
 ) {
 	DPrintf("%v - %v received AppendEntries RPC: %v", rf.state, rf.me, args)
+
+	reply.Trace.Entry = ConflictingEntry{
+		Term:  -1,
+		Index: -1,
+	}
+	reply.Trace.Len = -1
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -958,21 +972,19 @@ func (rf *Raft) AppendEntries(
 	}
 
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		entry := &reply.Trace.Entry
-		entry.Term = rf.log[args.PrevLogIndex].Term
+		reply.Trace.Entry.Term = rf.log[args.PrevLogIndex].Term
 		index := args.PrevLogIndex
 		for ; index > 0; index-- {
-			if rf.log[index].Term != entry.Term {
+			if rf.log[index].Term != reply.Trace.Entry.Term {
 				break
 			}
 		}
-		entry.Index = index + 1
+		reply.Trace.Entry.Index = index + 1
 
 		return
 	}
 
 	rf.log = rf.log[:args.PrevLogIndex+1]
-
 	rf.log = append(rf.log, args.Entries...)
 
 	rf.persist()
@@ -1099,9 +1111,7 @@ func Make(
 	rf.matchIndex = make([]int, len(peers))
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
-	if rf.votedFor == rf.me {
+	if rf.readPersist(persister.ReadRaftState()) && rf.votedFor == rf.me {
 		rf.state = leader
 		rf.resumeHeartbeat()
 		rf.stopElectionTimeout()
