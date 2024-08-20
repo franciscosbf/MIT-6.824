@@ -13,11 +13,10 @@ import (
 
 const (
 	heartbeatTimeout   = time.Millisecond * 100
-	electionTimeoutMin = time.Millisecond * 450
-	electionTimeoutMax = time.Millisecond * 600
+	electionTimeoutMin = time.Millisecond * 350
+	electionTimeoutMax = time.Millisecond * 500
 
-	batchStartSz       = 128
-	batchPersistenceSz = 10
+	batchStartSz = 128
 )
 
 func genElectionTimeout() time.Duration {
@@ -196,7 +195,7 @@ type Raft struct {
 	sendBatch             chan *AppendEntriesArgs
 	sending               []*int32
 	sendingAlert          []*sync.Cond
-	persistenceBatch      chan chan struct{}
+	// persistenceBatch      chan chan struct{}
 
 	// Persistent state
 	currentTerm int
@@ -846,53 +845,53 @@ func (rf *Raft) releasePendingSenders() {
 	}
 }
 
-func (rf *Raft) stateRecorder() {
-	go func() {
-		repliesBatch := make([]chan struct{}, batchPersistenceSz)
+// func (rf *Raft) stateRecorder() {
+// 	go func() {
+// 		repliesBatch := make([]chan struct{}, batchPersistenceSz)
+//
+// 		for {
+// 			select {
+// 			case <-rf.signalKill:
+// 				return
+// 			case reply := <-rf.persistenceBatch:
+// 				repliesBatch[0] = reply
+// 			}
+//
+// 			batched := 1
+// 			timer := time.After(time.Microsecond * 200)
+// 			for ; batched < batchPersistenceSz; batched++ {
+// 				select {
+// 				case reply := <-rf.persistenceBatch:
+// 					repliesBatch[batched] = reply
+//
+// 					continue
+// 					// default:
+// 				case <-timer:
+// 				}
+//
+// 				break
+// 			}
+//
+// 			rf.mu.Lock()
+// 			rf.persist()
+// 			rf.mu.Unlock()
+//
+// 			for _, b := range repliesBatch[:batched] {
+// 				go func(b chan<- struct{}) {
+// 					b <- struct{}{}
+// 				}(b)
+// 			}
+// 		}
+// 	}()
+// }
 
-		for {
-			select {
-			case <-rf.signalKill:
-				return
-			case reply := <-rf.persistenceBatch:
-				repliesBatch[0] = reply
-			}
-
-			batched := 1
-			timer := time.After(time.Microsecond * 200)
-			for ; batched < batchPersistenceSz; batched++ {
-				select {
-				case reply := <-rf.persistenceBatch:
-					repliesBatch[batched] = reply
-
-					continue
-					// default:
-				case <-timer:
-				}
-
-				break
-			}
-
-			rf.mu.Lock()
-			rf.persist()
-			rf.mu.Unlock()
-
-			for _, b := range repliesBatch[:batched] {
-				go func(b chan<- struct{}) {
-					b <- struct{}{}
-				}(b)
-			}
-		}
-	}()
-}
-
-func (rf *Raft) alertStateRecorder() {
-	reply := make(chan struct{}, 1)
-
-	rf.persistenceBatch <- reply
-
-	<-reply
-}
+// func (rf *Raft) alertStateRecorder() {
+// 	reply := make(chan struct{}, 1)
+//
+// 	rf.persistenceBatch <- reply
+//
+// 	<-reply
+// }
 
 func (rf *Raft) RequestVote(
 	args *RequestVoteArgs,
@@ -1100,7 +1099,7 @@ func Make(
 		rf.sending[pi] = new(int32)
 		rf.sendingAlert[pi] = sync.NewCond(&sync.Mutex{})
 	}
-	rf.persistenceBatch = make(chan chan struct{}, batchPersistenceSz)
+	// rf.persistenceBatch = make(chan chan struct{}, batchPersistenceSz)
 
 	rf.log = []Entry{{}}
 	rf.votedFor = -1
