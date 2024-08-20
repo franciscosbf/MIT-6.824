@@ -195,6 +195,7 @@ type Raft struct {
 	sendBatch             chan *AppendEntriesArgs
 	sending               []*int32
 	sendingAlert          []*sync.Cond
+	sendingPark           []chan struct{}
 	// persistenceBatch      chan chan struct{}
 
 	// Persistent state
@@ -286,7 +287,7 @@ func (rf *Raft) setFirstRecoveryEntry(
 	argsToUpdate *AppendEntriesArgs,
 	trace *RecoveryTrace,
 ) (peerNextIndex int) {
-	go func() {
+	defer func() {
 		argsToUpdate.PrevLogIndex = peerNextIndex - 1
 		argsToUpdate.PrevLogTerm = rf.log[argsToUpdate.PrevLogIndex].Term
 		argsToUpdate.Entries = rf.log[peerNextIndex:]
@@ -379,6 +380,7 @@ func (rf *Raft) fireHeartbeat() {
 				rf.mu.Lock()
 				if rf.state != leader {
 					rf.mu.Unlock()
+
 					return
 				}
 				rf.mu.Unlock()
@@ -734,6 +736,8 @@ func (rf *Raft) batchAppendEntries() {
 					}
 
 					go func(pi int) {
+						rf.sendingPark[pi] <- struct{}{}
+
 						rf.sendingAlert[pi].L.Lock()
 						for !atomic.CompareAndSwapInt32(rf.sending[pi], 0, 1) {
 							rf.sendingAlert[pi].Wait()
@@ -742,6 +746,8 @@ func (rf *Raft) batchAppendEntries() {
 
 						defer func() {
 							atomic.StoreInt32(rf.sending[pi], 0)
+
+							<-rf.sendingPark[pi]
 						}()
 
 						args := *rargs
@@ -757,19 +763,20 @@ func (rf *Raft) batchAppendEntries() {
 
 							rf.mu.Lock()
 							if rf.state != leader {
-								sendAck <- abort
 								rf.mu.Unlock()
 
+								sendAck <- abort
+
 								return
 							}
-							send := len(rf.log)-1 >= rf.nextIndex[pi]
+							if !(len(rf.log)-1 >= rf.nextIndex[pi]) {
+								rf.mu.Unlock()
+
+								sendAck <- appendSent
+
+								return
+							}
 							rf.mu.Unlock()
-
-							if !send {
-								sendAck <- appendNotSent
-
-								return
-							}
 
 							DPrintf("%v - %v tried to send to %v AppendEntries RPC as part of forward: %v",
 								rf.state, rf.me, pi, &args)
@@ -1095,9 +1102,11 @@ func Make(
 	rf.sendBatch = make(chan *AppendEntriesArgs, batchStartSz)
 	rf.sending = make([]*int32, len(peers))
 	rf.sendingAlert = make([]*sync.Cond, len(peers))
+	rf.sendingPark = make([]chan struct{}, len(peers))
 	for pi := 0; pi < len(rf.peers); pi++ {
 		rf.sending[pi] = new(int32)
 		rf.sendingAlert[pi] = sync.NewCond(&sync.Mutex{})
+		rf.sendingPark[pi] = make(chan struct{}, 1)
 	}
 	// rf.persistenceBatch = make(chan chan struct{}, batchPersistenceSz)
 
